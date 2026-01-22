@@ -1,9 +1,9 @@
 <?php
-// api/staff/login.php
-// Dedicated JWT login endpoint for mobile app (does NOT use sessions)
+// API/staff/login.php
+// Dedicated JWT login endpoint for mobile app (no sessions)
 
 header('Content-Type: application/json');
-header('Access-Control-Allow-Origin: *');           // ← tighten this later (Flutter origin)
+header('Access-Control-Allow-Origin: *');           // Tighten this in production
 header('Access-Control-Allow-Methods: POST, OPTIONS');
 header('Access-Control-Allow-Headers: Content-Type, Authorization');
 
@@ -12,22 +12,43 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
     exit;
 }
 
+// ────────────────────────────────────────────────
+// Dependencies
+// ────────────────────────────────────────────────
 require_once '../../vendor/autoload.php';
-require_once '../../Common/connection.php';
+use Firebase\JWT\JWT;
 
-use \Firebase\JWT\JWT;
-$jwt = JWT::encode($payload, $JWT_SECRET, 'HS256');
+require_once '../../Common/connection.php';  // brings $conn
 
-// IMPORTANT: Define your secret key here or better — load from config/env file
-// NEVER commit this to git in plain text!
-$JWT_SECRET = 'JGn%m*PZwVc3H9(TxgubLjqCUv)M#$Fkha58Q2BY7I^s4E&NWeKSRfpz+Xt!A6Dr';
+// ────────────────────────────────────────────────
+// Load JWT secret from .env (with fallback for local testing)
+// ────────────────────────────────────────────────
+$JWT_SECRET = $_ENV['JWT_SECRET'] ?? null;
 
-if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
-    http_response_code(405);
-    echo json_encode(['success' => false, 'error' => 'Method not allowed']);
+if (empty($JWT_SECRET)) {
+    http_response_code(500);
+    echo json_encode([
+        'success' => false,
+        'error' => 'JWT_SECRET is not configured in .env file'
+    ]);
     exit;
 }
 
+// ────────────────────────────────────────────────
+// Only POST allowed
+// ────────────────────────────────────────────────
+if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+    http_response_code(405);
+    echo json_encode([
+        'success' => false,
+        'error' => 'Only POST method is allowed'
+    ]);
+    exit;
+}
+
+// ────────────────────────────────────────────────
+// Read JSON input
+// ────────────────────────────────────────────────
 $input = json_decode(file_get_contents('php://input'), true) ?? [];
 
 $email    = trim($input['email']    ?? '');
@@ -38,13 +59,15 @@ if (empty($email) || empty($password) || empty($role)) {
     http_response_code(400);
     echo json_encode([
         'success' => false,
-        'error'   => 'Email, password and role are required'
+        'error' => 'Email, password and role are required'
     ]);
     exit;
 }
 
 try {
-    // Fetch user
+    // ────────────────────────────────────────────────
+    // Find user
+    // ────────────────────────────────────────────────
     $stmt = $conn->prepare("
         SELECT 
             id,
@@ -68,7 +91,7 @@ try {
         http_response_code(401);
         echo json_encode([
             'success' => false,
-            'error'   => 'Invalid email or role'
+            'error' => 'Invalid email or role'
         ]);
         exit;
     }
@@ -77,30 +100,30 @@ try {
         http_response_code(403);
         echo json_encode([
             'success' => false,
-            'error'   => 'Account is not active'
+            'error' => 'Account is not active'
         ]);
         exit;
     }
 
+    // ────────────────────────────────────────────────
     // Verify password
+    // ────────────────────────────────────────────────
     if (!password_verify($password, $user['password'])) {
         http_response_code(401);
         echo json_encode([
             'success' => false,
-            'error'   => 'Invalid password'
+            'error' => 'Invalid password'
         ]);
         exit;
     }
 
-    // Remove sensitive data before putting in token
-    unset($user['password']);
-    unset($user['status']);
-
-    // Create JWT payload
+    // ────────────────────────────────────────────────
+    // SUCCESS → Create JWT
+    // ────────────────────────────────────────────────
     $payload = [
-        'iss' => 'your-app-name.com.np',           // issuer
+        'iss' => 'restro-app.local',                // issuer
         'iat' => time(),                            // issued at
-        'exp' => time() + (3600 * 12),              // expires in 12 hours (adjust as needed)
+        'exp' => time() + (3600 * 12),              // 12 hours expiry
         'data' => [
             'user_id'       => (int)$user['id'],
             'restaurant_id' => (int)$user['restaurant_id'],
@@ -110,19 +133,20 @@ try {
         ]
     ];
 
+    $jwt = JWT::encode($payload, $JWT_SECRET, 'HS256');
 
-    // Success response
+    // Remove sensitive fields before sending user data
+    unset($user['password']);
+    unset($user['status']);
+
+    // ────────────────────────────────────────────────
+    // Final success response
+    // ────────────────────────────────────────────────
     echo json_encode([
-        'success' => true,
-        'token'   => $jwt,
-        'user'    => [
-            'id'            => $user['id'],
-            'restaurant_id' => $user['restaurant_id'],
-            'username'      => $user['username'],
-            'email'         => $user['email'],
-            'role'          => $user['role']
-        ],
-        'expires_in' => 3600 * 12   // seconds
+        'success'    => true,
+        'token'      => $jwt,
+        'user'       => $user,
+        'expires_in' => 3600 * 12   // in seconds
     ]);
 
 } catch (Exception $e) {
