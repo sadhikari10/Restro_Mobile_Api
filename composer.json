@@ -1,0 +1,8 @@
+{
+    "require": {
+        "ernilambar/nepali-date": "^1.0",
+        "phpoffice/phpspreadsheet": "1.29",
+        "vlucas/phpdotenv": "^5.6",
+        "phpmailer/phpmailer": "^7.0"
+    }
+}
