@@ -91,7 +91,7 @@ try {
         http_response_code(401);
         echo json_encode([
             'success' => false,
-            'error' => 'Invalid email or role'
+            'error' => 'Invalid credentials'
         ]);
         exit;
     }
@@ -112,7 +112,7 @@ try {
         http_response_code(401);
         echo json_encode([
             'success' => false,
-            'error' => 'Invalid password'
+            'error' => 'Invalid credentials'
         ]);
         exit;
     }
