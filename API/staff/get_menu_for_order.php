@@ -13,10 +13,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
     exit;
 }
 
-// Debug 1: File started
-echo json_encode(['debug_step' => '1_file_started', 'time' => microtime(true)]);
-flush();
-
 // ────────────────────────────────────────────────
 // Dependencies
 // ────────────────────────────────────────────────
@@ -24,15 +20,7 @@ require_once '../../vendor/autoload.php';
 use Firebase\JWT\JWT;
 use Firebase\JWT\Key;
 
-// Debug 2: Autoload done
-echo json_encode(['debug_step' => '2_autoload_done', 'time' => microtime(true)]);
-flush();
-
 require_once '../../Common/connection.php';  // brings $conn
-
-// Debug 3: Connection loaded
-echo json_encode(['debug_step' => '3_connection_loaded', 'time' => microtime(true)]);
-flush();
 
 // ────────────────────────────────────────────────
 // Load JWT secret from .env
@@ -47,10 +35,6 @@ if (empty($JWT_SECRET)) {
     ]);
     exit;
 }
-
-// Debug 4: Secret loaded
-echo json_encode(['debug_step' => '4_secret_loaded', 'time' => microtime(true)]);
-flush();
 
 // ────────────────────────────────────────────────
 // Only GET allowed
@@ -80,18 +64,10 @@ try {
 
     $token = $matches[1];
 
-    // Debug 5: Header extracted
-    echo json_encode(['debug_step' => '5_header_extracted', 'time' => microtime(true)]);
-    flush();
-
     // ────────────────────────────────────────────────
     // Validate JWT
     // ────────────────────────────────────────────────
     $decoded = JWT::decode($token, new Key($JWT_SECRET, 'HS256'));
-
-    // Debug 6: JWT decoded
-    echo json_encode(['debug_step' => '6_jwt_decoded', 'time' => microtime(true)]);
-    flush();
 
     $userData = $decoded->data ?? null;
 
@@ -115,10 +91,6 @@ try {
         exit;
     }
 
-    // Debug 7: User validated
-    echo json_encode(['debug_step' => '7_user_validated', 'restaurant_id' => $restaurant_id, 'time' => microtime(true)]);
-    flush();
-
     // ────────────────────────────────────────────────
     // Fetch available menu items
     // ────────────────────────────────────────────────
@@ -135,24 +107,11 @@ try {
         ORDER BY item_name ASC
     ");
 
-    // Debug 8: Menu prepare done
-    echo json_encode(['debug_step' => '8_menu_prepare_done', 'time' => microtime(true)]);
-    flush();
-
     $stmt->bind_param("i", $restaurant_id);
     $stmt->execute();
-
-    // Debug 9: Menu execute done
-    echo json_encode(['debug_step' => '9_menu_execute_done', 'time' => microtime(true)]);
-    flush();
-
     $result = $stmt->get_result();
     $menu = $result->fetch_all(MYSQLI_ASSOC);
     $stmt->close();
-
-    // Debug 10: Menu fetch done
-    echo json_encode(['debug_step' => '10_menu_fetch_done', 'menu_count' => count($menu), 'time' => microtime(true)]);
-    flush();
 
     // ────────────────────────────────────────────────
     // Unique categories (non-empty)
@@ -174,17 +133,8 @@ try {
         WHERE restaurant_id = ?
     ");
 
-    // Debug 11: Stock prepare done
-    echo json_encode(['debug_step' => '11_stock_prepare_done', 'time' => microtime(true)]);
-    flush();
-
     $stock_stmt->bind_param("i", $restaurant_id);
     $stock_stmt->execute();
-
-    // Debug 12: Stock execute done
-    echo json_encode(['debug_step' => '12_stock_execute_done', 'time' => microtime(true)]);
-    flush();
-
     $stock_result = $stock_stmt->get_result();
 
     $stock = [];
@@ -192,10 +142,6 @@ try {
         $stock[$row['stock_name']] = (int)$row['quantity'];
     }
     $stock_stmt->close();
-
-    // Debug 13: Stock fetch done
-    echo json_encode(['debug_step' => '13_stock_fetch_done', 'stock_count' => count($stock), 'time' => microtime(true)]);
-    flush();
 
     // ────────────────────────────────────────────────
     // Success response
