@@ -2,9 +2,9 @@
 // api/owner/restaurants.php
 
 header('Content-Type: application/json');
-header('Access-Control-Allow-Origin: *');           // tighten later
+header('Access-Control-Allow-Origin: *');
 header('Access-Control-Allow-Methods: GET, OPTIONS');
-header('Access-Control-Allow-Headers: Authorization, Content-Type');
+header('Access-Control-Allow-Headers: Authorization, Content-Type, X-Requested-With');
 
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
     http_response_code(200);
@@ -16,39 +16,70 @@ use Firebase\JWT\JWT;
 use Firebase\JWT\Key;
 
 require_once '../../Common/connection.php';
-require_once '../../Common/nepali_date.php';   // Adjust path if needed
+require_once '../../Common/nepali_date.php';
 
-// ─── JWT Secret ────────────────────────────────────────
 $JWT_SECRET = $_ENV['JWT_SECRET'] ?? null;
 if (empty($JWT_SECRET)) {
     http_response_code(500);
     echo json_encode(['success' => false, 'error' => 'Server configuration error']);
     exit;
 }
-echo('hi');
 
-// ─── Only GET allowed ──────────────────────────────────
 if ($_SERVER['REQUEST_METHOD'] !== 'GET') {
     http_response_code(405);
-    echo json_encode(['success' => false, 'error' => 'Method not allowed']);
+    echo json_encode(['success' => false, 'error' => 'Only GET allowed']);
     exit;
 }
 
-// ─── Get Authorization header ──────────────────────────
+// ────────────────────────────────────────────────
+// Improved token extraction (handles common header issues)
+// ────────────────────────────────────────────────
+$token = null;
+
+// Method 1: Standard getallheaders() (Apache)
 $headers = getallheaders();
-$authHeader = $headers['Authorization'] ?? '';
+if (isset($headers['Authorization'])) {
+    $token = $headers['Authorization'];
+} elseif (isset($headers['authorization'])) {
+    $token = $headers['authorization'];
+}
 
-if (!preg_match('/Bearer\s(\S+)/', $authHeader, $matches)) {
+// Method 2: Fallback to $_SERVER (sometimes more reliable)
+if (!$token && isset($_SERVER['HTTP_AUTHORIZATION'])) {
+    $token = $_SERVER['HTTP_AUTHORIZATION'];
+} elseif (!$token && isset($_SERVER['REDIRECT_HTTP_AUTHORIZATION'])) {
+    $token = $_SERVER['REDIRECT_HTTP_AUTHORIZATION'];
+}
+
+// Method 3: Parse from raw header if still missing
+if (!$token) {
+    $authHeader = '';
+    foreach ($headers as $k => $v) {
+        if (strtolower($k) === 'authorization') {
+            $authHeader = $v;
+            break;
+        }
+    }
+    if ($authHeader) $token = $authHeader;
+}
+
+// Clean up to get just the token part
+if ($token && preg_match('/Bearer\s+(.+)/i', $token, $matches)) {
+    $token = $matches[1];
+} else {
+    $token = null;
+}
+
+// ────────────────────────────────────────────────
+if (empty($token)) {
     http_response_code(401);
-    echo json_encode(['success' => false, 'error' => 'Token required']);
+    echo json_encode(['success' => false, 'error' => 'Authentication token required']);
     exit;
 }
 
-$jwt = $matches[1];
-
+// Now proceed with JWT validation
 try {
-    // Decode & validate JWT
-    $decoded = JWT::decode($jwt, new Key($JWT_SECRET, 'HS256'));
+    $decoded = JWT::decode($token, new Key($JWT_SECRET, 'HS256'));
     $user = (array) $decoded->data;
 
     if (!isset($user['role']) || $user['role'] !== 'superadmin') {
@@ -57,46 +88,39 @@ try {
         exit;
     }
 
-    $user_id = (int) $user['user_id'];
-    $chain_id = null;
+    $user_id = (int)$user['user_id'];
 
-    // Get chain_id for this superadmin
+    // Get chain_id
     $stmt = $conn->prepare("SELECT chain_id FROM users WHERE id = ? AND role = 'superadmin'");
     $stmt->bind_param("i", $user_id);
     $stmt->execute();
     $result = $stmt->get_result();
-    if ($row = $result->fetch_assoc()) {
-        $chain_id = $row['chain_id'];
-    }
-    $stmt->close();
-
-    if (!$chain_id) {
+    if ($result->num_rows === 0) {
         http_response_code(403);
         echo json_encode(['success' => false, 'error' => 'No chain associated']);
         exit;
     }
+    $row = $result->fetch_assoc();
+    $chain_id = (int)$row['chain_id'];
+    $stmt->close();
 
-    // Fetch all restaurants in this chain
+    // Fetch restaurants
     $stmt = $conn->prepare("
-        SELECT 
-            id, name, address, phone_number, 
-            expiry_date, is_trial, created_at
+        SELECT id, name, address, phone_number, expiry_date, is_trial, created_at 
         FROM restaurants 
-        WHERE chain_id = ?
-        ORDER BY created_at DESC
+        WHERE chain_id = ? 
+        ORDER BY name ASC
     ");
     $stmt->bind_param("i", $chain_id);
     $stmt->execute();
     $result = $stmt->get_result();
 
     $restaurants = [];
-    while ($row = $result->fetch_assoc()) {
-        // Optional: compute friendly status
-        $today_bs = substr(nepali_date_time(), 0, 10); // need nepali_date.php
-        $status = ($row['expiry_date'] < $today_bs)
-            ? 'Expired'
-            : ($row['is_trial'] ? 'Trial' : 'Active');
+    $today_bs = substr(nepali_date_time(), 0, 10);
 
+    while ($row = $result->fetch_assoc()) {
+        $status = ($row['expiry_date'] < $today_bs) ? 'Expired' : 
+                  ($row['is_trial'] == 1 ? 'Trial' : 'Active');
         $row['status'] = $status;
         $restaurants[] = $row;
     }
@@ -104,9 +128,9 @@ try {
 
     echo json_encode([
         'success'     => true,
-        'restaurants' => $restaurants,
-        'count'       => count($restaurants)
-    ]);
+        'count'       => count($restaurants),
+        'restaurants' => $restaurants
+    ], JSON_NUMERIC_CHECK);
 
 } catch (\Firebase\JWT\ExpiredException $e) {
     http_response_code(401);
@@ -116,5 +140,7 @@ try {
     echo json_encode(['success' => false, 'error' => 'Invalid token']);
 } catch (Exception $e) {
     http_response_code(500);
-    echo json_encode(['success' => false, 'error' => 'Server error']);
+    echo json_encode(['success' => false, 'error' => 'Server error: ' . $e->getMessage()]);
 }
+
+exit;
