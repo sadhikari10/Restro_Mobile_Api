@@ -32,17 +32,70 @@ if ($_SERVER['REQUEST_METHOD'] !== 'GET') {
     exit;
 }
 
-// ─── Token validation ────────────────────────────────────────────────
+// ────────────────────────────────────────────────
+// Robust token extraction with debug logging
+// ────────────────────────────────────────────────
 $headers = getallheaders();
-$authHeader = $headers['Authorization'] ?? '';
-if (!preg_match('/Bearer\s(\S+)/', $authHeader, $matches)) {
+
+// Log all possible header locations
+error_log("DEBUG: All getallheaders(): " . json_encode($headers));
+error_log("DEBUG: HTTP_AUTHORIZATION in \$_SERVER: " . ($_SERVER['HTTP_AUTHORIZATION'] ?? 'NOT SET'));
+error_log("DEBUG: REDIRECT_HTTP_AUTHORIZATION in \$_SERVER: " . ($_SERVER['REDIRECT_HTTP_AUTHORIZATION'] ?? 'NOT SET'));
+error_log("DEBUG: Authorization in headers: " . ($headers['Authorization'] ?? 'NOT SET'));
+error_log("DEBUG: authorization in headers: " . ($headers['authorization'] ?? 'NOT SET'));
+
+$token = null;
+
+// 1. Standard getallheaders()
+if (isset($headers['Authorization'])) {
+    $token = $headers['Authorization'];
+} elseif (isset($headers['authorization'])) {
+    $token = $headers['authorization'];
+}
+
+// 2. $_SERVER fallbacks
+if (!$token && isset($_SERVER['HTTP_AUTHORIZATION'])) {
+    $token = $_SERVER['HTTP_AUTHORIZATION'];
+} elseif (!$token && isset($_SERVER['REDIRECT_HTTP_AUTHORIZATION'])) {
+    $token = $_SERVER['REDIRECT_HTTP_AUTHORIZATION'];
+}
+
+// 3. apache_request_headers() if available
+if (!$token && function_exists('apache_request_headers')) {
+    $apacheHeaders = apache_request_headers();
+    if (isset($apacheHeaders['Authorization'])) {
+        $token = $apacheHeaders['Authorization'];
+    } elseif (isset($apacheHeaders['authorization'])) {
+        $token = $apacheHeaders['authorization'];
+    }
+}
+
+// 4. Final fallback: case-insensitive loop
+if (!$token) {
+    foreach ($headers as $key => $value) {
+        if (strtolower($key) === 'authorization') {
+            $token = $value;
+            break;
+        }
+    }
+}
+
+// Extract Bearer token
+if ($token && preg_match('/Bearer\s+(.+)/i', $token, $matches)) {
+    $token = trim($matches[1]);
+    error_log("DEBUG: Token successfully extracted: " . substr($token, 0, 20) . '...');
+} else {
+    $token = null;
+    error_log("DEBUG: No Bearer token found in any header");
+}
+
+if (empty($token)) {
     http_response_code(401);
-    echo json_encode(['success' => false, 'error' => 'Token required']);
+    echo json_encode(['success' => false, 'error' => 'Authentication token required (header not detected)']);
     exit;
 }
 
-$token = $matches[1];
-
+// ─── JWT validation ──────────────────────────────────────────────────
 try {
     $decoded = JWT::decode($token, new Key($JWT_SECRET, 'HS256'));
     $user = (array)$decoded->data;
