@@ -1,8 +1,6 @@
 <?php
 // api/owner/take_order.php
-// POST endpoint: Places a new order for a specific restaurant
-// Protected by JWT - only superadmin allowed
-// Expects JSON body: { "restaurant_id": int, "table_identifier": string, "items": [ {item_id, quantity, notes}, ... ] }
+// POST - Places order from owner (superadmin) interface
 
 header('Content-Type: application/json');
 header('Access-Control-Allow-Origin: *');
@@ -34,11 +32,11 @@ if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
     exit;
 }
 
-// Read JSON input
+// ─── Read JSON ───────────────────────────────────────────────────────
 $input = json_decode(file_get_contents('php://input'), true);
 if ($input === null) {
     http_response_code(400);
-    echo json_encode(['success' => false, 'error' => 'Invalid JSON payload']);
+    echo json_encode(['success' => false, 'error' => 'Invalid JSON']);
     exit;
 }
 
@@ -48,29 +46,28 @@ $items            = $input['items'] ?? [];
 
 if ($restaurant_id <= 0) {
     http_response_code(400);
-    echo json_encode(['success' => false, 'error' => 'restaurant_id is required']);
+    echo json_encode(['success' => false, 'error' => 'restaurant_id required']);
     exit;
 }
 if (empty($table_identifier)) {
     http_response_code(400);
-    echo json_encode(['success' => false, 'error' => 'Table identifier (number/name/phone) is required']);
+    echo json_encode(['success' => false, 'error' => 'Table / customer identifier required']);
     exit;
 }
 if (empty($items) || !is_array($items)) {
     http_response_code(400);
-    echo json_encode(['success' => false, 'error' => 'Items array is required and must not be empty']);
+    echo json_encode(['success' => false, 'error' => 'items array required and non-empty']);
     exit;
 }
 
-// ─── Token validation ────────────────────────────────────────────────
+// ─── JWT + role check ────────────────────────────────────────────────
 $headers = getallheaders();
-$authHeader = $headers['Authorization'] ?? '';
-if (!preg_match('/Bearer\s(\S+)/', $authHeader, $matches)) {
+$authHeader = $headers['Authorization'] ?? $headers['authorization'] ?? '';
+if (!preg_match('/Bearer\s+(\S+)/i', $authHeader, $matches)) {
     http_response_code(401);
-    echo json_encode(['success' => false, 'error' => 'Token required']);
+    echo json_encode(['success' => false, 'error' => 'Bearer token required']);
     exit;
 }
-
 $token = $matches[1];
 
 try {
@@ -79,178 +76,158 @@ try {
 
     if (!isset($user['role']) || $user['role'] !== 'superadmin') {
         http_response_code(403);
-        echo json_encode(['success' => false, 'error' => 'Only owner allowed']);
+        echo json_encode(['success' => false, 'error' => 'Superadmin access only']);
         exit;
     }
 
     $user_id = (int)$user['user_id'];
 
-    // ─── Verify restaurant belongs to this owner ───────────────────────
-    $check = $conn->prepare("
+    // ─── Verify restaurant belongs to this superadmin's chain ────────
+    $stmt = $conn->prepare("
         SELECT chain_id 
         FROM restaurants 
         WHERE id = ?
     ");
-    if ($check === false) {
-        http_response_code(500);
-        echo json_encode(['success' => false, 'error' => 'Database prepare error (restaurant check): ' . $conn->error]);
-        exit;
-    }
-    $check->bind_param("i", $restaurant_id);
-    $check->execute();
-    $res = $check->get_result();
-
+    $stmt->bind_param("i", $restaurant_id);
+    $stmt->execute();
+    $res = $stmt->get_result();
     if ($res->num_rows === 0) {
         http_response_code(403);
-        echo json_encode(['success' => false, 'error' => 'Invalid restaurant']);
+        echo json_encode(['success' => false, 'error' => 'Restaurant not found']);
         exit;
     }
+    $chain_id = (int)$res->fetch_assoc()['chain_id'];
+    $stmt->close();
 
-    $rest_row = $res->fetch_assoc();
-    $chain_id = (int)$rest_row['chain_id'];
-    $check->close();
-
-    // Confirm owner has this chain
-    $owner_check = $conn->prepare("
-        SELECT id FROM users 
+    $stmt = $conn->prepare("
+        SELECT 1 
+        FROM users 
         WHERE id = ? AND chain_id = ? AND role = 'superadmin'
         LIMIT 1
     ");
-    if ($owner_check === false) {
-        http_response_code(500);
-        echo json_encode(['success' => false, 'error' => 'Database prepare error (owner check): ' . $conn->error]);
-        exit;
-    }
-    $owner_check->bind_param("ii", $user_id, $chain_id);
-    $owner_check->execute();
-    if ($owner_check->get_result()->num_rows === 0) {
+    $stmt->bind_param("ii", $user_id, $chain_id);
+    $stmt->execute();
+    if ($stmt->get_result()->num_rows === 0) {
         http_response_code(403);
-        echo json_encode(['success' => false, 'error' => 'Unauthorized restaurant']);
+        echo json_encode(['success' => false, 'error' => 'Unauthorized for this restaurant']);
         exit;
     }
-    $owner_check->close();
+    $stmt->close();
 
-    // ─── Validate items & fetch prices + check stock ─────────────────────
-    $placeholders = str_repeat('?,', count($items) - 1) . '?';
-    $item_stmt = $conn->prepare("
+    // ─── Validate items belong to restaurant + get prices ────────────
+    $item_ids = array_column($items, 'item_id');
+    $placeholders = str_repeat('?,', count($item_ids) - 1) . '?';
+    $stmt = $conn->prepare("
         SELECT id, item_name, price 
         FROM menu_items 
-        WHERE id IN ($placeholders) AND restaurant_id = ? AND status = 'available'
+        WHERE id IN ($placeholders) 
+          AND restaurant_id = ? 
+          AND status = 'available'
     ");
-    if ($item_stmt === false) {
-        http_response_code(500);
-        echo json_encode(['success' => false, 'error' => 'Prepare failed (menu items): ' . $conn->error]);
-        exit;
-    }
-
-    $item_ids = array_column($items, 'item_id');
     $types = str_repeat('i', count($item_ids)) . 'i';
     $params = array_merge($item_ids, [$restaurant_id]);
+    $stmt->bind_param($types, ...$params);
+    $stmt->execute();
+    $result = $stmt->get_result();
 
-    $item_stmt->bind_param($types, ...$params);
-    $item_stmt->execute();
-    $result = $item_stmt->get_result();
-
-    $prices = [];
+    $menu_data = [];
     while ($row = $result->fetch_assoc()) {
-        $prices[$row['id']] = [
+        $menu_data[$row['id']] = [
             'name'  => $row['item_name'],
             'price' => (float)$row['price']
         ];
     }
-    $item_stmt->close();
+    $stmt->close();
 
-    // Validate all items exist and are available
-    $total = 0.0;
-    $order_items = [];
-    $stock_deduction = [];
+    if (count($menu_data) !== count($item_ids)) {
+        http_response_code(400);
+        echo json_encode([
+            'success' => false,
+            'error'   => 'One or more items do not belong to this restaurant or are unavailable'
+        ]);
+        exit;
+    }
 
-    foreach ($items as $item) {
-        $item_id = (int)($item['item_id'] ?? 0);
-        $qty = max(1, (int)($item['quantity'] ?? 1));
-        $notes = trim($item['notes'] ?? '');
+    // ─── Prepare order items & total ─────────────────────────────────
+    $order_items   = [];
+    $total_amount  = 0.0;
+    $stock_to_check = [];
 
-        if (!isset($prices[$item_id])) {
-            http_response_code(400);
-            echo json_encode(['success' => false, 'error' => "Item ID $item_id not found or unavailable"]);
-            exit;
-        }
+    foreach ($items as $it) {
+        $item_id  = (int)($it['item_id'] ?? 0);
+        $qty      = max(1, (int)($it['quantity'] ?? 1));
+        $notes    = trim($it['notes'] ?? '');
 
-        $name = $prices[$item_id]['name'];
-        $price = $prices[$item_id]['price'];
+        if (!isset($menu_data[$item_id])) continue; // already checked, but safety
 
-        $total += $qty * $price;
+        $price    = $menu_data[$item_id]['price'];
+        $name     = $menu_data[$item_id]['name'];
+
+        $total_amount += $price * $qty;
+
         $order_items[] = [
             'item_id'   => $item_id,
             'quantity'  => $qty,
-            'notes'     => $notes,
-            'item_name' => $name
+            'notes'     => $notes
         ];
 
-        $stock_deduction[$name] = ($stock_deduction[$name] ?? 0) + $qty;
+        $stock_to_check[$name] = ($stock_to_check[$name] ?? 0) + $qty;
     }
 
-    // ─── Begin transaction ───────────────────────────────────────────────
+    if (empty($order_items)) {
+        http_response_code(400);
+        echo json_encode(['success' => false, 'error' => 'No valid items']);
+        exit;
+    }
+
+    // ─── Transaction ─────────────────────────────────────────────────
     $conn->begin_transaction();
 
     try {
-        // Check & deduct stock
-        foreach ($stock_deduction as $name => $needed) {
-            $stock_stmt = $conn->prepare("
+        // Deduct stock ONLY if tracked
+        foreach ($stock_to_check as $name => $needed) {
+            $s = $conn->prepare("
                 SELECT quantity 
                 FROM stock_inventory 
                 WHERE restaurant_id = ? AND stock_name = ?
                 FOR UPDATE
             ");
-            $stock_stmt->bind_param("is", $restaurant_id, $name);
-            $stock_stmt->execute();
-            $stock_res = $stock_stmt->get_result();
+            $s->bind_param("is", $restaurant_id, $name);
+            $s->execute();
+            $res = $s->get_result();
 
-            if ($stock_res->num_rows === 0) {
-                throw new Exception("Stock item '$name' not found");
+            if ($row = $res->fetch_assoc()) {
+                // tracked → must have enough
+                if ($row['quantity'] < $needed) {
+                    throw new Exception("Insufficient stock for '$name' (needed $needed, available {$row['quantity']})");
+                }
+                $upd = $conn->prepare("
+                    UPDATE stock_inventory 
+                    SET quantity = quantity - ? 
+                    WHERE restaurant_id = ? AND stock_name = ?
+                ");
+                $upd->bind_param("iis", $needed, $restaurant_id, $name);
+                $upd->execute();
+                $upd->close();
             }
-
-            $stock_row = $stock_res->fetch_assoc();
-            $current_stock = (int)$stock_row['quantity'];
-
-            if ($current_stock < $needed) {
-                throw new Exception("Insufficient stock for '$name' (needed $needed, available $current_stock)");
-            }
-
-            // Deduct stock
-            $update_stmt = $conn->prepare("
-                UPDATE stock_inventory 
-                SET quantity = quantity - ? 
-                WHERE restaurant_id = ? AND stock_name = ?
-            ");
-            $update_stmt->bind_param("iis", $needed, $restaurant_id, $name);
-            $update_stmt->execute();
-            $update_stmt->close();
-            $stock_stmt->close();
+            // not tracked → skip silently
+            $s->close();
         }
 
         // Insert order
-        $order_stmt = $conn->prepare("
-            INSERT INTO orders (
-                restaurant_id, 
-                table_number, 
-                total_amount, 
-                items, 
-                order_by, 
-                status, 
-                created_at
-            ) VALUES (?, ?, ?, ?, ?, 'preparing', ?)
-        ");
-        if ($order_stmt === false) {
-            throw new Exception('Prepare failed (order insert): ' . $conn->error);
-        }
-
         $items_json = json_encode($order_items);
         $now = nepali_date_time();
-        $order_stmt->bind_param("isdiss", $restaurant_id, $table_identifier, $total, $items_json, $user_id, $now);
-        $order_stmt->execute();
+
+        $stmt = $conn->prepare("
+            INSERT INTO orders (
+                restaurant_id, table_number, total_amount, items, 
+                order_by, status, created_at
+            ) VALUES (?, ?, ?, ?, ?, 'preparing', ?)
+        ");
+        $stmt->bind_param("isdsis", $restaurant_id, $table_identifier, $total_amount, $items_json, $user_id, $now);
+        $stmt->execute();
         $order_id = $conn->insert_id;
-        $order_stmt->close();
+        $stmt->close();
 
         $conn->commit();
 
