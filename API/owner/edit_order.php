@@ -36,7 +36,6 @@ if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
 $token = null;
 $headers = getallheaders();
 
-// Prefer custom header first
 if (isset($headers['X-Authorization'])) {
     $token = $headers['X-Authorization'];
 } elseif (isset($headers['x-authorization'])) {
@@ -47,7 +46,6 @@ if (isset($headers['X-Authorization'])) {
     $token = $headers['authorization'];
 }
 
-// Fallback to $_SERVER
 if (!$token && isset($_SERVER['HTTP_X_AUTHORIZATION'])) {
     $token = $_SERVER['HTTP_X_AUTHORIZATION'];
 } elseif (!$token && isset($_SERVER['HTTP_AUTHORIZATION'])) {
@@ -58,7 +56,6 @@ if (!$token && isset($_SERVER['HTTP_X_AUTHORIZATION'])) {
     $token = $_SERVER['REDIRECT_HTTP_AUTHORIZATION'];
 }
 
-// Final fallback: case-insensitive loop
 if (!$token) {
     foreach ($headers as $k => $v) {
         $lowerK = strtolower($k);
@@ -69,7 +66,6 @@ if (!$token) {
     }
 }
 
-// Extract Bearer part
 if ($token && preg_match('/Bearer\s+(.+)/i', $token, $matches)) {
     $token = trim($matches[1]);
     error_log("EDIT_ORDER - Token extracted: " . substr($token, 0, 20) . "...");
@@ -122,11 +118,7 @@ try {
     }
 
     // ─── Verify ownership ──────────────────────────────────────────
-    $check = $conn->prepare("
-        SELECT chain_id 
-        FROM restaurants 
-        WHERE id = ?
-    ");
+    $check = $conn->prepare("SELECT chain_id FROM restaurants WHERE id = ?");
     $check->bind_param("i", $restaurant_id);
     $check->execute();
     $res = $check->get_result();
@@ -178,29 +170,60 @@ try {
 
     $current_items = json_decode($order['items'], true) ?? [];
 
-    // ─── Audit ──────────────────────────────────────────────────────
+    // ─── Prepare audit data ────────────────────────────────────────
     $old_data = json_encode([
-        'items' => $current_items,
+        'items'        => $current_items,
         'total_amount' => $order['total_amount'],
         'table_number' => $order['table_number']
     ]);
+
     $change_time = nepali_date_time();
-    $remark = ($action === 'delete') ? 'Deleted by owner' : 'Edited by owner';
+    $remark = ($action === 'delete') ? 'Deleted by owner' : 'Updated by owner';
 
-    $audit = $conn->prepare("
-        INSERT INTO old_order 
-        (order_id, restaurant_id, changed_by, change_time, old_data, remarks) 
-        VALUES (?, ?, ?, ?, ?, ?)
-    ");
-    $audit->bind_param("iiisss", $order_id, $restaurant_id, $user_id, $change_time, $old_data, $remark);
-    $audit->execute();
-    $audit->close();
-
+    // ─── Start transaction ──────────────────────────────────────────
     $conn->begin_transaction();
 
     try {
+        // ─── AUDIT LOG - INSIDE TRANSACTION + DEBUG LOGGING ────────
+        error_log("===== OWNER AUDIT DEBUG START =====");
+        error_log("Order ID: $order_id | Action: $action | User ID: $user_id");
+        error_log("Change time: $change_time");
+        error_log("Old data length: " . strlen($old_data));
+
+        $audit = $conn->prepare("
+            INSERT INTO old_order 
+            (order_id, restaurant_id, changed_by, change_time, old_data, remarks) 
+            VALUES (?, ?, ?, ?, ?, ?)
+        ");
+
+        if ($audit === false) {
+            error_log("OWNER AUDIT PREPARE FAILED: " . $conn->error);
+            throw new Exception("Audit prepare failed: " . $conn->error);
+        }
+
+        error_log("Audit statement prepared successfully");
+
+        $bind_result = $audit->bind_param("iiisss", $order_id, $restaurant_id, $user_id, $change_time, $old_data, $remark);
+        if (!$bind_result) {
+            error_log("OWNER AUDIT BIND FAILED: " . $audit->error);
+            throw new Exception("Audit bind failed");
+        }
+
+        error_log("Audit parameters bound successfully");
+
+        if (!$audit->execute()) {
+            error_log("OWNER AUDIT EXECUTE FAILED: " . $audit->error . " | MySQL error: " . $conn->error);
+            throw new Exception("Audit log insert failed: " . $conn->error);
+        }
+
+        error_log("OWNER AUDIT INSERT SUCCESS - Affected rows: " . $audit->affected_rows);
+        error_log("===== OWNER AUDIT DEBUG END ======");
+
+        $audit->close();
+
+        // ─── Action-specific logic ──────────────────────────────────
         if ($action === 'delete') {
-            // Restore stock
+            // Restore stock (aligned with web version)
             foreach ($current_items as $ci) {
                 $item_id = (int)$ci['item_id'];
                 $qty = (int)$ci['quantity'];
@@ -215,11 +238,7 @@ try {
                 $stock_name = $name_row['item_name'] ?? null;
                 if (!$stock_name) continue;
 
-                $check = $conn->prepare("
-                    SELECT quantity FROM stock_inventory 
-                    WHERE restaurant_id = ? AND stock_name = ?
-                    FOR UPDATE
-                ");
+                $check = $conn->prepare("SELECT quantity FROM stock_inventory WHERE restaurant_id = ? AND stock_name = ? FOR UPDATE");
                 $check->bind_param("is", $restaurant_id, $stock_name);
                 $check->execute();
                 $stock_res = $check->get_result();
@@ -228,11 +247,7 @@ try {
                     $current = (int)$stock_res->fetch_assoc()['quantity'];
                     $new_qty = $current + $qty;
 
-                    $upd = $conn->prepare("
-                        UPDATE stock_inventory 
-                        SET quantity = ? 
-                        WHERE restaurant_id = ? AND stock_name = ?
-                    ");
+                    $upd = $conn->prepare("UPDATE stock_inventory SET quantity = ? WHERE restaurant_id = ? AND stock_name = ?");
                     $upd->bind_param("iis", $new_qty, $restaurant_id, $stock_name);
                     $upd->execute();
                     $upd->close();
@@ -314,7 +329,7 @@ try {
                 throw new Exception('No valid items in update');
             }
 
-            // Stock delta
+            // Stock delta (aligned with web version)
             $old_map = [];
             foreach ($current_items as $ci) {
                 $old_map[(int)$ci['item_id']] = (int)$ci['quantity'];
@@ -344,11 +359,7 @@ try {
                 $stock_name = $name_row['item_name'] ?? null;
                 if (!$stock_name) continue;
 
-                $check = $conn->prepare("
-                    SELECT quantity FROM stock_inventory 
-                    WHERE restaurant_id = ? AND stock_name = ?
-                    FOR UPDATE
-                ");
+                $check = $conn->prepare("SELECT quantity FROM stock_inventory WHERE restaurant_id = ? AND stock_name = ? FOR UPDATE");
                 $check->bind_param("is", $restaurant_id, $stock_name);
                 $check->execute();
                 $stock_res = $check->get_result();
@@ -360,11 +371,7 @@ try {
                         throw new Exception("Insufficient stock for '$stock_name' (need +$delta, have $current)");
                     }
 
-                    $upd = $conn->prepare("
-                        UPDATE stock_inventory 
-                        SET quantity = quantity + ? 
-                        WHERE restaurant_id = ? AND stock_name = ?
-                    ");
+                    $upd = $conn->prepare("UPDATE stock_inventory SET quantity = quantity + ? WHERE restaurant_id = ? AND stock_name = ?");
                     $upd->bind_param("iis", $delta, $restaurant_id, $stock_name);
                     $upd->execute();
                     $upd->close();
