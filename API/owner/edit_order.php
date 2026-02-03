@@ -5,7 +5,7 @@
 header('Content-Type: application/json');
 header('Access-Control-Allow-Origin: *');
 header('Access-Control-Allow-Methods: POST, OPTIONS');
-header('Access-Control-Allow-Headers: Authorization, Content-Type');
+header('Access-Control-Allow-Headers: Content-Type, Authorization, X-Authorization');
 
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
     http_response_code(200);
@@ -36,16 +36,24 @@ if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
 $token = null;
 $headers = getallheaders();
 
-// Try standard casing
-if (isset($headers['Authorization'])) {
+// Prefer custom header first
+if (isset($headers['X-Authorization'])) {
+    $token = $headers['X-Authorization'];
+} elseif (isset($headers['x-authorization'])) {
+    $token = $headers['x-authorization'];
+} elseif (isset($headers['Authorization'])) {
     $token = $headers['Authorization'];
 } elseif (isset($headers['authorization'])) {
     $token = $headers['authorization'];
 }
 
 // Fallback to $_SERVER
-if (!$token && isset($_SERVER['HTTP_AUTHORIZATION'])) {
+if (!$token && isset($_SERVER['HTTP_X_AUTHORIZATION'])) {
+    $token = $_SERVER['HTTP_X_AUTHORIZATION'];
+} elseif (!$token && isset($_SERVER['HTTP_AUTHORIZATION'])) {
     $token = $_SERVER['HTTP_AUTHORIZATION'];
+} elseif (!$token && isset($_SERVER['REDIRECT_HTTP_X_AUTHORIZATION'])) {
+    $token = $_SERVER['REDIRECT_HTTP_X_AUTHORIZATION'];
 } elseif (!$token && isset($_SERVER['REDIRECT_HTTP_AUTHORIZATION'])) {
     $token = $_SERVER['REDIRECT_HTTP_AUTHORIZATION'];
 }
@@ -53,7 +61,8 @@ if (!$token && isset($_SERVER['HTTP_AUTHORIZATION'])) {
 // Final fallback: case-insensitive loop
 if (!$token) {
     foreach ($headers as $k => $v) {
-        if (strtolower($k) === 'authorization') {
+        $lowerK = strtolower($k);
+        if ($lowerK === 'x-authorization' || $lowerK === 'authorization') {
             $token = $v;
             break;
         }
@@ -216,12 +225,15 @@ try {
                 $stock_res = $check->get_result();
 
                 if ($stock_res->num_rows > 0) {
+                    $current = (int)$stock_res->fetch_assoc()['quantity'];
+                    $new_qty = $current + $qty;
+
                     $upd = $conn->prepare("
                         UPDATE stock_inventory 
-                        SET quantity = quantity + ? 
+                        SET quantity = ? 
                         WHERE restaurant_id = ? AND stock_name = ?
                     ");
-                    $upd->bind_param("iis", $qty, $restaurant_id, $stock_name);
+                    $upd->bind_param("iis", $new_qty, $restaurant_id, $stock_name);
                     $upd->execute();
                     $upd->close();
                 }

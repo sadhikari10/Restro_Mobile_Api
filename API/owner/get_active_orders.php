@@ -6,7 +6,7 @@
 header('Content-Type: application/json');
 header('Access-Control-Allow-Origin: *');
 header('Access-Control-Allow-Methods: GET, OPTIONS');
-header('Access-Control-Allow-Headers: Authorization, Content-Type');
+header('Access-Control-Allow-Headers: Content-Type, Authorization, X-Authorization');
 
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
     http_response_code(200);
@@ -32,14 +32,44 @@ if ($_SERVER['REQUEST_METHOD'] !== 'GET') {
     exit;
 }
 
-// ─── JWT validation ───────────────────────────────────────────────
+// ─── Get token from multiple possible places ───────────────────────
 $headers = getallheaders();
-$authHeader = $headers['Authorization'] ?? '';
-if (!preg_match('/Bearer\s(\S+)/', $authHeader, $matches)) {
+$authHeader = null;
+
+// Prefer custom header first
+if (isset($headers['X-Authorization'])) {
+    $authHeader = $headers['X-Authorization'];
+} elseif (isset($headers['x-authorization'])) {
+    $authHeader = $headers['x-authorization'];
+} elseif (isset($headers['Authorization'])) {
+    $authHeader = $headers['Authorization'];
+} elseif (isset($headers['authorization'])) {
+    $authHeader = $headers['authorization'];
+}
+
+// Fallback to $_SERVER
+if (!$authHeader && isset($_SERVER['HTTP_X_AUTHORIZATION'])) {
+    $authHeader = $_SERVER['HTTP_X_AUTHORIZATION'];
+} elseif (!$authHeader && isset($_SERVER['HTTP_AUTHORIZATION'])) {
+    $authHeader = $_SERVER['HTTP_AUTHORIZATION'];
+}
+
+// Last chance: case insensitive search
+if (!$authHeader) {
+    foreach ($headers as $k => $v) {
+        if (strtolower($k) === 'x-authorization' || strtolower($k) === 'authorization') {
+            $authHeader = $v;
+            break;
+        }
+    }
+}
+
+if (!$authHeader || !preg_match('/Bearer\s+(\S+)/i', $authHeader, $matches)) {
     http_response_code(401);
     echo json_encode(['success' => false, 'error' => 'Token required']);
     exit;
 }
+
 $token = $matches[1];
 
 try {
