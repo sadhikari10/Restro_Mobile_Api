@@ -16,7 +16,13 @@ if (empty($_SESSION['current_restaurant_id'])) {
 
 $restaurant_id = $_SESSION['current_restaurant_id'];
 $error_msg = '';
-$success_msg = isset($_GET['success']) ? 'Order placed successfully!' : '';
+$success_msg = '';
+
+// Flash success – only shown immediately after redirect
+if (isset($_SESSION['just_placed_order']) && $_SESSION['just_placed_order'] === true) {
+    $success_msg = 'Order placed successfully!';
+    unset($_SESSION['just_placed_order']);   // disappears on next refresh
+}
 
 if (empty($_SESSION['order_token'])) {
     $_SESSION['order_token'] = bin2hex(random_bytes(16));
@@ -133,8 +139,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
                     $conn->commit();
 
+                    $_SESSION['just_placed_order'] = true;
                     $_SESSION['order_token'] = bin2hex(random_bytes(16));
-                    header("Location: take_order.php?success=1");
+
+                    header("Location: take_order.php");
                     exit;
 
                 } catch (Exception $e) {
@@ -183,7 +191,6 @@ $table_identifier_val = $_POST['table_identifier'] ?? '';
         .item-details { display: none; margin-top: 12px; }
         .stock-available { color: #17a2b8; font-weight: 500; }
         .placeholder-text { text-align: center; padding: 80px 20px; color: #6c757d; font-size: 1.4rem; min-height: 300px; display: flex; align-items: center; justify-content: center; }
-        #selectedItemsList { max-height: 400px; overflow-y: auto; }
         #centerToast {
             position: fixed;
             top: 50%;
@@ -194,6 +201,7 @@ $table_identifier_val = $_POST['table_identifier'] ?? '';
             box-shadow: 0 4px 20px rgba(0,0,0,0.2);
             display: none;
         }
+        #success-alert { transition: opacity 0.8s ease-out; }
     </style>
 </head>
 <body class="bg-light">
@@ -208,7 +216,7 @@ $table_identifier_val = $_POST['table_identifier'] ?? '';
     </div>
 
     <?php if ($success_msg): ?>
-    <div class="my-4 text-center">
+    <div class="my-4 text-center" id="success-alert">
         <div class="alert alert-success p-4 rounded shadow-sm">
             <i class="bi bi-check-circle-fill text-success me-2" style="font-size: 1.5rem;"></i>
             <strong><?= htmlspecialchars($success_msg) ?></strong>
@@ -255,7 +263,6 @@ $table_identifier_val = $_POST['table_identifier'] ?? '';
                 <div id="placeholder" class="placeholder-text">Loading items...</div>
                 <div class="row g-3" id="menuGrid"></div>
 
-                <!-- Hidden container for form fields (always in DOM) -->
                 <div id="hiddenFieldsContainer" style="display:none;"></div>
 
                 <div class="text-center mt-5">
@@ -295,263 +302,285 @@ $table_identifier_val = $_POST['table_identifier'] ?? '';
 
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
 <script>
-    const menuItems = <?= json_encode($menu_items) ?>;
-    const stock = <?= json_encode($stock) ?>;
-    const categories = <?= json_encode($categories) ?>;
+// ────────────────────────────────────────────────
+// Auto-hide success message after 5 seconds
+// ────────────────────────────────────────────────
+<?php if ($success_msg): ?>
+document.addEventListener('DOMContentLoaded', function() {
+    const successDiv = document.getElementById('success-alert');
+    if (successDiv) {
+        setTimeout(() => {
+            successDiv.style.opacity = '0';
+            setTimeout(() => {
+                successDiv.style.display = 'none';
+            }, 800); // match transition duration
+        }, 5000);
+    }
+});
+<?php endif; ?>
 
-    // Global mutable array to store selected items from all categories
-    let selectedItemsArray = [];
+// ────────────────────────────────────────────────
+// Rest of your JavaScript (unchanged)
+// ────────────────────────────────────────────────
+const menuItems = <?= json_encode($menu_items) ?>;
+const stock = <?= json_encode($stock) ?>;
+const categories = <?= json_encode($categories) ?>;
 
-    const STORAGE_KEY = 'superadmin_order_temp';
+let selectedItemsArray = [];
+const STORAGE_KEY = 'superadmin_order_temp';
 
-    const grid = document.getElementById('menuGrid');
-    const placeholder = document.getElementById('placeholder');
-    const hiddenFieldsContainer = document.getElementById('hiddenFieldsContainer');
+const grid = document.getElementById('menuGrid');
+const placeholder = document.getElementById('placeholder');
+const hiddenFieldsContainer = document.getElementById('hiddenFieldsContainer');
+const tableInput = document.getElementById('table_identifier');
 
-    function escapeHtml(text) {
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text || '';
+    return div.innerHTML;
+}
+
+function saveOrderData() {
+    const saveData = {
+        table: tableInput.value.trim(),
+        items: selectedItemsArray
+    };
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(saveData));
+}
+
+function loadOrderData() {
+    const saved = localStorage.getItem(STORAGE_KEY);
+    if (saved) {
+        try {
+            const data = JSON.parse(saved);
+            tableInput.value = data.table || '';
+            selectedItemsArray = data.items || [];
+            renderHiddenFields();
+        } catch (e) {
+            selectedItemsArray = [];
+        }
+    }
+}
+
+function clearOrderData() {
+    localStorage.removeItem(STORAGE_KEY);
+    selectedItemsArray = [];
+    tableInput.value = '';
+    renderHiddenFields();
+    document.querySelectorAll('.form-check-input').forEach(cb => cb.checked = false);
+    document.querySelectorAll('.item-details').forEach(el => el.style.display = 'none');
+}
+
+function renderHiddenFields() {
+    hiddenFieldsContainer.innerHTML = '';
+    selectedItemsArray.forEach(item => {
+        const checkbox = document.createElement('input');
+        checkbox.type = 'hidden';
+        checkbox.name = 'selected_items[]';
+        checkbox.value = item.id;
+
+        const qtyInput = document.createElement('input');
+        qtyInput.type = 'hidden';
+        qtyInput.name = `quantities[${item.id}]`;
+        qtyInput.value = item.qty;
+
+        const notesInput = document.createElement('input');
+        notesInput.type = 'hidden';
+        notesInput.name = `notes[${item.id}]`;
+        notesInput.value = item.notes;
+
+        hiddenFieldsContainer.appendChild(checkbox);
+        hiddenFieldsContainer.appendChild(qtyInput);
+        hiddenFieldsContainer.appendChild(notesInput);
+    });
+}
+
+function addToSelected(itemId, qty = 1, notes = '') {
+    const existingIndex = selectedItemsArray.findIndex(i => i.id == itemId);
+    if (existingIndex !== -1) {
+        selectedItemsArray[existingIndex] = { id: itemId, qty, notes };
+    } else {
+        selectedItemsArray.push({ id: itemId, qty, notes });
+    }
+    saveOrderData();
+    renderHiddenFields();
+}
+
+function removeFromSelected(itemId) {
+    selectedItemsArray = selectedItemsArray.filter(i => i.id != itemId);
+    saveOrderData();
+    renderHiddenFields();
+}
+
+function renderCategory(category) {
+    grid.innerHTML = '';
+    placeholder.style.display = 'none';
+
+    const filtered = menuItems.filter(item => (item.category || '').trim() === category);
+    if (filtered.length === 0) {
+        grid.innerHTML = '<div class="col-12 text-center py-5 text-muted">No items in this category</div>';
+        return;
+    }
+
+    filtered.forEach(item => {
+        const selected = selectedItemsArray.find(i => i.id == item.id) || { qty: 1, notes: '' };
+        const checked = selectedItemsArray.some(i => i.id == item.id);
+        const hasStock = stock.hasOwnProperty(item.item_name);
+        const stockDisplay = hasStock ? stock[item.item_name] : null;
+
         const div = document.createElement('div');
-        div.textContent = text || '';
-        return div.innerHTML;
-    }
-
-    function saveOrderData() {
-        const saveData = {
-            table: document.getElementById('table_identifier').value.trim(),
-            items: selectedItemsArray
-        };
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(saveData));
-    }
-
-    function loadOrderData() {
-        const saved = localStorage.getItem(STORAGE_KEY);
-        if (saved) {
-            try {
-                const data = JSON.parse(saved);
-                document.getElementById('table_identifier').value = data.table || '';
-                selectedItemsArray = data.items || [];
-                renderHiddenFields();
-            } catch (e) {
-                selectedItemsArray = [];
-            }
-        }
-    }
-
-    function renderHiddenFields() {
-        hiddenFieldsContainer.innerHTML = '';
-
-        selectedItemsArray.forEach(item => {
-            const checkbox = document.createElement('input');
-            checkbox.type = 'hidden';
-            checkbox.name = 'selected_items[]';
-            checkbox.value = item.id;
-
-            const qtyInput = document.createElement('input');
-            qtyInput.type = 'hidden';
-            qtyInput.name = `quantities[${item.id}]`;
-            qtyInput.value = item.qty;
-
-            const notesInput = document.createElement('input');
-            notesInput.type = 'hidden';
-            notesInput.name = `notes[${item.id}]`;
-            notesInput.value = item.notes;
-
-            hiddenFieldsContainer.appendChild(checkbox);
-            hiddenFieldsContainer.appendChild(qtyInput);
-            hiddenFieldsContainer.appendChild(notesInput);
-        });
-    }
-
-    function addToSelected(itemId, qty = 1, notes = '') {
-        const existingIndex = selectedItemsArray.findIndex(i => i.id == itemId);
-        if (existingIndex !== -1) {
-            selectedItemsArray[existingIndex] = { id: itemId, qty, notes };
-        } else {
-            selectedItemsArray.push({ id: itemId, qty, notes });
-        }
-        saveOrderData();
-        renderHiddenFields();
-    }
-
-    function removeFromSelected(itemId) {
-        selectedItemsArray = selectedItemsArray.filter(i => i.id != itemId);
-        saveOrderData();
-        renderHiddenFields();
-    }
-
-    function renderCategory(category) {
-        grid.innerHTML = '';
-        placeholder.style.display = 'none';
-
-        const filtered = menuItems.filter(item => (item.category || '').trim() === category);
-        if (filtered.length === 0) {
-            grid.innerHTML = '<div class="col-12 text-center py-5 text-muted">No items in this category</div>';
-            return;
-        }
-
-        filtered.forEach(item => {
-            const selected = selectedItemsArray.find(i => i.id == item.id) || { qty: 1, notes: '' };
-            const checked = selectedItemsArray.some(i => i.id == item.id);
-            const hasStock = stock.hasOwnProperty(item.item_name);
-            const stockDisplay = hasStock ? stock[item.item_name] : null;
-
-            const div = document.createElement('div');
-            div.className = 'col-6 col-md-4 col-lg-3';
-            div.innerHTML = `
-                <div class="card h-100 border-0 shadow-sm item-card">
-                    <div class="card-body p-3">
-                        <div class="form-check">
-                            <input class="form-check-input" type="checkbox" value="${item.id}" id="item_${item.id}" ${checked ? 'checked' : ''}>
-                            <label class="form-check-label fw-bold small d-block" for="item_${item.id}">
-                                ${escapeHtml(item.item_name)}
-                                <span class="badge bg-info ms-1 small">${escapeHtml(item.category)}</span>
-                                <span class="text-success float-end small">Rs ${parseFloat(item.price).toFixed(2)}</span>
-                            </label>
-                            ${item.description ? `<small class="d-block text-muted mt-1 small">${escapeHtml(item.description)}</small>` : ''}
-                            <div class="mt-2 small">
-                                <span class="badge bg-success">Available</span>
-                                ${hasStock ? `<span class="ms-2 stock-available">Stock: ${stockDisplay}</span>` : ''}
-                            </div>
+        div.className = 'col-6 col-md-4 col-lg-3';
+        div.innerHTML = `
+            <div class="card h-100 border-0 shadow-sm item-card">
+                <div class="card-body p-3">
+                    <div class="form-check">
+                        <input class="form-check-input" type="checkbox" value="${item.id}" id="item_${item.id}" ${checked ? 'checked' : ''}>
+                        <label class="form-check-label fw-bold small d-block" for="item_${item.id}">
+                            ${escapeHtml(item.item_name)}
+                            <span class="badge bg-info ms-1 small">${escapeHtml(item.category)}</span>
+                            <span class="text-success float-end small">Rs ${parseFloat(item.price).toFixed(2)}</span>
+                        </label>
+                        ${item.description ? `<small class="d-block text-muted mt-1 small">${escapeHtml(item.description)}</small>` : ''}
+                        <div class="mt-2 small">
+                            <span class="badge bg-success">Available</span>
+                            ${hasStock ? `<span class="ms-2 stock-available">Stock: ${stockDisplay}</span>` : ''}
                         </div>
-                        <div id="details_${item.id}" style="display:${checked ? 'block' : 'none'}; margin-top:12px;">
-                            <div class="input-group input-group-sm mb-2">
-                                <span class="input-group-text">Qty</span>
-                                <input type="number" class="form-control qty-input" value="${selected.qty}" min="1" data-item-id="${item.id}">
-                            </div>
-                            <div class="input-group input-group-sm">
-                                <span class="input-group-text">Notes</span>
-                                <input type="text" class="form-control notes-input" value="${escapeHtml(selected.notes)}" placeholder="e.g. less spicy" data-item-id="${item.id}">
-                            </div>
+                    </div>
+                    <div id="details_${item.id}" style="display:${checked ? 'block' : 'none'}; margin-top:12px;">
+                        <div class="input-group input-group-sm mb-2">
+                            <span class="input-group-text">Qty</span>
+                            <input type="number" class="form-control qty-input" value="${selected.qty}" min="1" data-item-id="${item.id}">
+                        </div>
+                        <div class="input-group input-group-sm">
+                            <span class="input-group-text">Notes</span>
+                            <input type="text" class="form-control notes-input" value="${escapeHtml(selected.notes)}" placeholder="e.g. less spicy" data-item-id="${item.id}">
                         </div>
                     </div>
                 </div>
-            `;
-            grid.appendChild(div);
-        });
+            </div>
+        `;
+        grid.appendChild(div);
+    });
+}
+
+// ────────────────────────────────────────────────
+// Event listeners (unchanged)
+// ────────────────────────────────────────────────
+grid.addEventListener('change', function(e) {
+    if (e.target.type === 'checkbox') {
+        const itemId = e.target.value;
+        const details = document.getElementById('details_' + itemId);
+        const qtyInput = details?.querySelector('.qty-input');
+        const notesInput = details?.querySelector('.notes-input');
+
+        if (e.target.checked) {
+            if (details) details.style.display = 'block';
+            const qty = qtyInput ? parseInt(qtyInput.value) || 1 : 1;
+            const notes = notesInput ? notesInput.value.trim() : '';
+            addToSelected(itemId, qty, notes);
+        } else {
+            if (details) details.style.display = 'none';
+            removeFromSelected(itemId);
+        }
+    }
+});
+
+grid.addEventListener('input', function(e) {
+    if (e.target.classList.contains('qty-input') || e.target.classList.contains('notes-input')) {
+        const itemId = e.target.dataset.itemId;
+        if (itemId && selectedItemsArray.some(i => i.id == itemId)) {
+            const card = e.target.closest('.card');
+            const qty = parseInt(card.querySelector('.qty-input')?.value) || 1;
+            const notes = card.querySelector('.notes-input')?.value.trim() || '';
+            addToSelected(itemId, qty, notes);
+        }
+    }
+});
+
+document.querySelectorAll('#categoryTabs button').forEach(tab => {
+    tab.addEventListener('click', function () {
+        document.querySelectorAll('#categoryTabs button').forEach(t => t.classList.remove('active'));
+        this.classList.add('active');
+        renderCategory(this.dataset.category);
+        document.getElementById('searchInput').value = '';
+    });
+});
+
+document.getElementById('searchInput').addEventListener('input', function () {
+    const term = this.value.toLowerCase().trim();
+    grid.querySelectorAll('.col-6, .col-md-4, .col-lg-3').forEach(card => {
+        const text = card.textContent.toLowerCase();
+        card.style.display = text.includes(term) ? 'block' : 'none';
+    });
+});
+
+function showCenterToast(message) {
+    document.getElementById('toastMessage').textContent = message;
+    document.getElementById('centerToast').style.display = 'block';
+    setTimeout(() => document.getElementById('centerToast').style.display = 'none', 4000);
+}
+
+document.getElementById('reviewOrderBtn').addEventListener('click', function () {
+    const table = tableInput.value.trim();
+    if (selectedItemsArray.length === 0) {
+        showCenterToast('Please select at least one item.');
+        return;
+    }
+    if (!table) {
+        showCenterToast('Please enter Table Number or Customer Name / Phone.');
+        return;
     }
 
-    // Event listeners
-    grid.addEventListener('change', function(e) {
-        if (e.target.type === 'checkbox') {
-            const itemId = e.target.value;
-            const details = document.getElementById('details_' + itemId);
-            const qtyInput = details.querySelector('.qty-input');
-            const notesInput = details.querySelector('.notes-input');
+    let html = `<p class="fw-bold fs-5 mb-3">Order for: <span class="text-primary">${escapeHtml(table)}</span></p>`;
+    html += '<ul class="list-group list-group-flush">';
+    let total = 0;
 
-            if (e.target.checked) {
-                details.style.display = 'block';
-                const qty = parseInt(qtyInput.value) || 1;
-                const notes = notesInput.value.trim();
-                addToSelected(itemId, qty, notes);
-            } else {
-                details.style.display = 'none';
-                removeFromSelected(itemId);
-            }
-        }
+    selectedItemsArray.forEach(sel => {
+        const item = menuItems.find(i => i.id == sel.id);
+        if (!item) return;
+        const sub = item.price * sel.qty;
+        total += sub;
+        html += `
+            <li class="list-group-item d-flex justify-content-between">
+                <div>
+                    <div class="fw-bold">${escapeHtml(item.item_name)} × ${sel.qty}</div>
+                    ${sel.notes ? `<small class="text-muted">${escapeHtml(sel.notes)}</small>` : ''}
+                </div>
+                <span class="badge bg-primary rounded-pill">Rs ${sub.toFixed(2)}</span>
+            </li>`;
     });
 
-    grid.addEventListener('input', function(e) {
-        if (e.target.classList.contains('qty-input') || e.target.classList.contains('notes-input')) {
-            const itemId = e.target.dataset.itemId;
-            if (itemId && selectedItemsArray.some(i => i.id == itemId)) {
-                const qty = parseInt(e.target.closest('.card').querySelector('.qty-input').value) || 1;
-                const notes = e.target.closest('.card').querySelector('.notes-input').value.trim();
-                addToSelected(itemId, qty, notes);
-            }
-        }
-    });
+    html += `</ul><hr><div class="d-flex justify-content-between fs-5">
+        <strong>Total Amount:</strong>
+        <strong class="text-success">Rs ${total.toFixed(2)}</strong>
+    </div>`;
 
-    // Tab switching
-    document.querySelectorAll('#categoryTabs button').forEach(tab => {
-        tab.addEventListener('click', function () {
-            document.querySelectorAll('#categoryTabs button').forEach(t => t.classList.remove('active'));
-            this.classList.add('active');
-            renderCategory(this.dataset.category);
-            document.getElementById('searchInput').value = '';
-        });
-    });
+    document.getElementById('orderSummary').innerHTML = html;
+    new bootstrap.Modal(document.getElementById('confirmModal')).show();
+});
 
-    // Search
-    document.getElementById('searchInput').addEventListener('input', function () {
-        const term = this.value.toLowerCase().trim();
-        grid.querySelectorAll('.col-6, .col-md-4, .col-lg-3').forEach(card => {
-            const text = card.textContent.toLowerCase();
-            card.style.display = text.includes(term) ? 'block' : 'none';
-        });
-    });
+document.getElementById('placeOrderBtn').addEventListener('click', () => {
+    document.getElementById('orderForm').submit();
+});
 
-    // Centered Toast
-    function showCenterToast(message) {
-        document.getElementById('toastMessage').textContent = message;
-        document.getElementById('centerToast').style.display = 'block';
-        setTimeout(() => document.getElementById('centerToast').style.display = 'none', 4000);
+document.addEventListener('DOMContentLoaded', () => {
+    loadOrderData();
+
+    if (categories.length > 0) {
+        renderCategory(categories[0]);
+        document.querySelector('#categoryTabs button')?.classList.add('active');
     }
 
-    // Review Order
-    document.getElementById('reviewOrderBtn').addEventListener('click', function () {
-        const table = document.getElementById('table_identifier').value.trim();
-        if (selectedItemsArray.length === 0) {
-            showCenterToast('Please select at least one item.');
-            return;
-        }
-        if (!table) {
-            showCenterToast('Please enter Table Number or Customer Name / Phone.');
-            return;
-        }
+    tableInput.addEventListener('input', saveOrderData);
 
-        let html = `<p class="fw-bold fs-5 mb-3">Order for: <span class="text-primary">${escapeHtml(table)}</span></p>`;
-        html += '<ul class="list-group list-group-flush">';
-        let total = 0;
+    <?php if ($success_msg): ?>
+        clearOrderData();
+    <?php endif; ?>
+});
 
-        selectedItemsArray.forEach(sel => {
-            const item = menuItems.find(i => i.id == sel.id);
-            if (!item) return;
-            const sub = item.price * sel.qty;
-            total += sub;
-            html += `
-                <li class="list-group-item d-flex justify-content-between">
-                    <div>
-                        <div class="fw-bold">${escapeHtml(item.item_name)} × ${sel.qty}</div>
-                        ${sel.notes ? `<small class="text-muted">${escapeHtml(sel.notes)}</small>` : ''}
-                    </div>
-                    <span class="badge bg-primary rounded-pill">Rs ${sub.toFixed(2)}</span>
-                </li>`;
-        });
-
-        html += `</ul><hr><div class="d-flex justify-content-between fs-5">
-            <strong>Total Amount:</strong>
-            <strong class="text-success">Rs ${total.toFixed(2)}</strong>
-        </div>`;
-
-        document.getElementById('orderSummary').innerHTML = html;
-        new bootstrap.Modal('#confirmModal').show();
-    });
-
-    // Place Order
-    document.getElementById('placeOrderBtn').addEventListener('click', () => {
-        document.getElementById('orderForm').submit();
-    });
-
-    // Initial load
-    document.addEventListener('DOMContentLoaded', () => {
-        loadOrderData();
-
-        if (categories.length > 0) {
-            renderCategory(categories[0]);
-            document.querySelector('#categoryTabs button').classList.add('active');
-        }
-
-        document.getElementById('table_identifier').addEventListener('input', saveOrderData);
-
-        <?php if (isset($_GET['success'])): ?>
-            localStorage.removeItem(STORAGE_KEY);
-            selectedItemsArray = [];
-            renderHiddenFields();
-        <?php endif; ?>
-    });
-
-    document.querySelector('a.btn-secondary[href="view_branch.php"]')?.addEventListener('click', () => {
-        localStorage.removeItem(STORAGE_KEY);
-    });
+document.querySelector('a.btn-secondary[href="view_branch.php"]')?.addEventListener('click', () => {
+    localStorage.removeItem(STORAGE_KEY);
+});
 </script>
 
 <?php include '../Common/footer.php'; ?>
