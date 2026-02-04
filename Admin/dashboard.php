@@ -49,10 +49,10 @@ if (empty($_SESSION['logged_in']) || empty($_SESSION['restaurant_id'])) {
                         <a href="orders.php" class="btn btn-info btn-custom">🧾 View Orders</a>
                         <a href="charges.php" class="btn btn-warning btn-custom">💰 Charges & VAT</a>
                         <a href="order_history.php" class="btn btn-success btn-custom">📜 Order History</a>
-                        <a href="stock_management.php" class="btn btn-secondary btn-custom">📦 Stock Management</a>
+                        <a href="stock_management.php" class="btn btn-secondary btn-custom">Inventory</a>			                       
+			<a href="view_stock.php" class="btn btn-dark">Inventory History</a>
                         <a href="general_purchase.php" class="btn btn-dark">General Purchase</a>
                         <a href="view_general_bills.php" class="btn btn-dark">General Purchase History</a>
-                        <a href="view_stock.php" class="btn btn-dark">View Stock</a>
                         <a href="sales_report.php" class="btn btn-dark">Sales Report</a>
                         <a href="credit_orders.php" class="btn btn-danger">Credit/Udharo</a>
                         <a href="clear_credit.php" class="btn btn-danger">Clear credit</a>

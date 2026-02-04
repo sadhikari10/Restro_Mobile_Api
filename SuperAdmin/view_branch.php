@@ -96,10 +96,10 @@ if (!$branch) {
             <a href="orders.php" class="btn btn-warning">View Orders</a>
             <a href="charges.php" class="btn btn-secondary">Charges & VAT</a>
             <a href="order_history.php" class="btn btn-success">Order History</a>
-            <a href="stock_management.php" class="btn btn-dark">Stock Management</a>
+            <a href="stock_management.php" class="btn btn-dark">Inventory</a>
+	    <a href="view_stock.php" class="btn btn-dark">Inventory History</a>
             <a href="general_purchase.php" class="btn btn-dark">General purchase</a>
             <a href="view_general_bills.php" class="btn btn-dark">General purchase history</a>
-            <a href="view_stock.php" class="btn btn-dark">View Stock</a>
             <a href="sales_report.php" class="btn btn-dark">Sales Report</a>
             <a href="credit_orders.php" class="btn btn-danger">Credit/Udharo</a>
             <a href="clear_credit.php" class="btn btn-danger">Clear Credit</a>
