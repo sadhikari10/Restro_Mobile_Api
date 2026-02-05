@@ -12,71 +12,40 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
     exit;
 }
 
-// ────────────────────────────────────────────────
-// Dependencies
-// ────────────────────────────────────────────────
 require_once '../../vendor/autoload.php';
 use Firebase\JWT\JWT;
 
-require_once '../../Common/connection.php';  // brings $conn
+require_once '../../Common/connection.php';
+require_once '../../Common/nepali_date.php';  // ← has ad_to_bs() & nepali_date_time()
 
-// ────────────────────────────────────────────────
-// Load JWT secret from .env (with fallback for local testing)
-// ────────────────────────────────────────────────
 $JWT_SECRET = $_ENV['JWT_SECRET'] ?? null;
-
 if (empty($JWT_SECRET)) {
     http_response_code(500);
-    echo json_encode([
-        'success' => false,
-        'error' => 'JWT_SECRET is not configured in .env file'
-    ]);
+    echo json_encode(['success' => false, 'error' => 'JWT_SECRET missing']);
     exit;
 }
 
-// ────────────────────────────────────────────────
-// Only POST allowed
-// ────────────────────────────────────────────────
 if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
     http_response_code(405);
-    echo json_encode([
-        'success' => false,
-        'error' => 'Only POST method is allowed'
-    ]);
+    echo json_encode(['success' => false, 'error' => 'Only POST allowed']);
     exit;
 }
 
-// ────────────────────────────────────────────────
-// Read JSON input
-// ────────────────────────────────────────────────
 $input = json_decode(file_get_contents('php://input'), true) ?? [];
 
-$email    = trim($input['email']    ?? '');
-$password = $input['password']      ?? '';
-$role     = trim($input['role']     ?? '');
+$email    = trim($input['email'] ?? '');
+$password = $input['password'] ?? '';
+$role     = trim($input['role'] ?? '');
 
 if (empty($email) || empty($password) || empty($role)) {
     http_response_code(400);
-    echo json_encode([
-        'success' => false,
-        'error' => 'Email, password and role are required'
-    ]);
+    echo json_encode(['success' => false, 'error' => 'Email, password and role required']);
     exit;
 }
 
 try {
-    // ────────────────────────────────────────────────
-    // Find user
-    // ────────────────────────────────────────────────
     $stmt = $conn->prepare("
-        SELECT 
-            id,
-            restaurant_id,
-            username,
-            email,
-            role,
-            status,
-            password
+        SELECT id, restaurant_id, username, email, role, status, password
         FROM users 
         WHERE email = ? AND role = ?
         LIMIT 1
@@ -87,46 +56,75 @@ try {
     $user = $result->fetch_assoc();
     $stmt->close();
 
-    if (!$user) {
+    if (!$user || !password_verify($password, $user['password'])) {
         http_response_code(401);
-        echo json_encode([
-            'success' => false,
-            'error' => 'Invalid credentials'
-        ]);
+        echo json_encode(['success' => false, 'error' => 'Invalid credentials']);
         exit;
     }
 
     if ($user['status'] !== 'active') {
         http_response_code(403);
-        echo json_encode([
-            'success' => false,
-            'error' => 'Account is not active'
-        ]);
+        echo json_encode(['success' => false, 'error' => 'Account is not active']);
         exit;
     }
 
     // ────────────────────────────────────────────────
-    // Verify password
+    // Expiry check using BS dates (no AD conversion needed)
     // ────────────────────────────────────────────────
-    if (!password_verify($password, $user['password'])) {
-        http_response_code(401);
-        echo json_encode([
-            'success' => false,
-            'error' => 'Invalid credentials'
-        ]);
-        exit;
+    $expiryInfo = [
+        'has_expiry'   => false,
+        'expired'      => false,
+        'expiry_date'  => null,
+        'is_trial'     => false,
+        'message'      => null,
+    ];
+
+    if ($user['restaurant_id'] !== null && $user['role'] !== 'superadmin') {
+        $restStmt = $conn->prepare("
+            SELECT expiry_date, is_trial
+            FROM restaurants 
+            WHERE id = ?
+        ");
+        $restStmt->bind_param("i", $user['restaurant_id']);
+        $restStmt->execute();
+        $restResult = $restStmt->get_result();
+
+        if ($row = $restResult->fetch_assoc()) {
+            $bs_expiry = trim($row['expiry_date'] ?? '');
+            $is_trial  = (bool)$row['is_trial'];
+
+            if (preg_match('/^\d{4}-\d{2}-\d{2}$/', $bs_expiry)) {
+                // Get current BS date (YYYY-MM-DD)
+                $current_bs_full = nepali_date_time();           // e.g. "2082-10-22 14:35:12"
+                $current_bs_date = substr($current_bs_full, 0, 10);  // "2082-10-22"
+
+                // Compare strings directly (YYYY-MM-DD format allows safe comparison)
+                $expired = $current_bs_date > $bs_expiry;
+
+                $expiryInfo = [
+                    'has_expiry'   => true,
+                    'expired'      => $expired,
+                    'expiry_date'  => $bs_expiry,
+                    'is_trial'     => $is_trial,
+                    'message'      => $expired
+                        ? ($is_trial ? 'Trial period has expired' : 'Subscription has expired')
+                        : null,
+                ];
+            }
+        }
+        $restStmt->close();
     }
 
     // ────────────────────────────────────────────────
-    // SUCCESS → Create JWT
+    // Create JWT
     // ────────────────────────────────────────────────
     $payload = [
-        'iss' => 'restro-app.local',                // issuer
-        'iat' => time(),                            // issued at
-        'exp' => time() + (3600 * 12),              // 12 hours expiry
+        'iss' => 'restro-app.local',
+        'iat' => time(),
+        'exp' => time() + (3600 * 12),
         'data' => [
             'user_id'       => (int)$user['id'],
-            'restaurant_id' => (int)$user['restaurant_id'],
+            'restaurant_id' => $user['restaurant_id'] !== null ? (int)$user['restaurant_id'] : null,
             'username'      => $user['username'],
             'email'         => $user['email'],
             'role'          => $user['role']
@@ -135,18 +133,15 @@ try {
 
     $jwt = JWT::encode($payload, $JWT_SECRET, 'HS256');
 
-    // Remove sensitive fields before sending user data
     unset($user['password']);
     unset($user['status']);
 
-    // ────────────────────────────────────────────────
-    // Final success response
-    // ────────────────────────────────────────────────
     echo json_encode([
-        'success'    => true,
-        'token'      => $jwt,
-        'user'       => $user,
-        'expires_in' => 3600 * 12   // in seconds
+        'success'     => true,
+        'token'       => $jwt,
+        'user'        => $user,
+        'expiry_info' => $expiryInfo,
+        'expires_in'  => 3600 * 12
     ]);
 
 } catch (Exception $e) {
