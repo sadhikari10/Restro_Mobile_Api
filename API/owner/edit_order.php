@@ -153,77 +153,47 @@ try {
     $stmt->bind_param("ii", $order_id, $restaurant_id);
     $stmt->execute();
     $result = $stmt->get_result();
-    $order = $result->fetch_assoc();
+    $current = $result->fetch_assoc();
     $stmt->close();
 
-    if (!$order) {
+    if (!$current) {
         http_response_code(404);
         echo json_encode(['success' => false, 'error' => 'Order not found']);
         exit;
     }
 
-    if ($order['status'] !== 'preparing') {
+    if (!in_array($current['status'], ['preparing', 'pending'])) {
         http_response_code(403);
-        echo json_encode(['success' => false, 'error' => 'Only preparing orders can be modified']);
+        echo json_encode(['success' => false, 'error' => 'Cannot modify order in this status']);
         exit;
     }
 
-    $current_items = json_decode($order['items'], true) ?? [];
+    $current_items = json_decode($current['items'], true) ?? [];
 
-    // ─── Prepare audit data ────────────────────────────────────────
+    // ─── Audit log ──────────────────────────────────────────────────
     $old_data = json_encode([
         'items'        => $current_items,
-        'total_amount' => $order['total_amount'],
-        'table_number' => $order['table_number']
+        'total_amount' => $current['total_amount'],
+        'table_number' => $current['table_number']
     ]);
 
-    $change_time = nepali_date_time();
-    $remark = ($action === 'delete') ? 'Deleted by owner' : 'Updated by owner';
+    $time = nepali_date_time();
+    $remark = ($action === 'delete') ? 'Order deleted by superadmin' : 'Order updated by superadmin';
 
-    // ─── Start transaction ──────────────────────────────────────────
+    $audit = $conn->prepare("
+        INSERT INTO old_order
+        (order_id, restaurant_id, changed_by, change_time, old_data, remarks)
+        VALUES (?, ?, ?, ?, ?, ?)
+    ");
+    $audit->bind_param("iiisss", $order_id, $restaurant_id, $user_id, $time, $old_data, $remark);
+    $audit->execute();
+    $audit->close();
+
     $conn->begin_transaction();
 
     try {
-        // ─── AUDIT LOG - INSIDE TRANSACTION + DEBUG LOGGING ────────
-        error_log("===== OWNER AUDIT DEBUG START =====");
-        error_log("Order ID: $order_id | Action: $action | User ID: $user_id");
-        error_log("Change time: $change_time");
-        error_log("Old data length: " . strlen($old_data));
-
-        $audit = $conn->prepare("
-            INSERT INTO old_order 
-            (order_id, restaurant_id, changed_by, change_time, old_data, remarks) 
-            VALUES (?, ?, ?, ?, ?, ?)
-        ");
-
-        if ($audit === false) {
-            error_log("OWNER AUDIT PREPARE FAILED: " . $conn->error);
-            throw new Exception("Audit prepare failed: " . $conn->error);
-        }
-
-        error_log("Audit statement prepared successfully");
-
-        $bind_result = $audit->bind_param("iiisss", $order_id, $restaurant_id, $user_id, $change_time, $old_data, $remark);
-        if (!$bind_result) {
-            error_log("OWNER AUDIT BIND FAILED: " . $audit->error);
-            throw new Exception("Audit bind failed");
-        }
-
-        error_log("Audit parameters bound successfully");
-
-        if (!$audit->execute()) {
-            error_log("OWNER AUDIT EXECUTE FAILED: " . $audit->error . " | MySQL error: " . $conn->error);
-            throw new Exception("Audit log insert failed: " . $conn->error);
-        }
-
-        error_log("OWNER AUDIT INSERT SUCCESS - Affected rows: " . $audit->affected_rows);
-        error_log("===== OWNER AUDIT DEBUG END ======");
-
-        $audit->close();
-
-        // ─── Action-specific logic ──────────────────────────────────
         if ($action === 'delete') {
-            // Restore stock (aligned with web version)
+            // Restore stock
             foreach ($current_items as $ci) {
                 $item_id = (int)$ci['item_id'];
                 $qty = (int)$ci['quantity'];
@@ -238,167 +208,194 @@ try {
                 $stock_name = $name_row['item_name'] ?? null;
                 if (!$stock_name) continue;
 
-                $check = $conn->prepare("SELECT quantity FROM stock_inventory WHERE restaurant_id = ? AND stock_name = ? FOR UPDATE");
+                $check = $conn->prepare("
+                    SELECT quantity FROM stock_inventory 
+                    WHERE restaurant_id = ? AND stock_name = ?
+                    FOR UPDATE
+                ");
                 $check->bind_param("is", $restaurant_id, $stock_name);
                 $check->execute();
                 $stock_res = $check->get_result();
 
                 if ($stock_res->num_rows > 0) {
-                    $current = (int)$stock_res->fetch_assoc()['quantity'];
-                    $new_qty = $current + $qty;
-
-                    $upd = $conn->prepare("UPDATE stock_inventory SET quantity = ? WHERE restaurant_id = ? AND stock_name = ?");
-                    $upd->bind_param("iis", $new_qty, $restaurant_id, $stock_name);
-                    $upd->execute();
-                    $upd->close();
+                    $restore = $conn->prepare("
+                        UPDATE stock_inventory 
+                        SET quantity = quantity + ? 
+                        WHERE restaurant_id = ? AND stock_name = ?
+                    ");
+                    $restore->bind_param("iis", $qty, $restaurant_id, $stock_name);
+                    $restore->execute();
+                    $restore->close();
                 }
                 $check->close();
             }
 
-            // Hard delete
+            // Delete order
             $del = $conn->prepare("DELETE FROM orders WHERE id = ? AND restaurant_id = ?");
             $del->bind_param("ii", $order_id, $restaurant_id);
             $del->execute();
             $del->close();
 
             $conn->commit();
-
-            echo json_encode([
-                'success' => true,
-                'message' => 'Order deleted successfully'
-            ]);
-        } else { // update
-            if (empty($table_identifier)) {
-                throw new Exception('Table identifier required for update');
-            }
-            if (empty($items) || !is_array($items)) {
-                throw new Exception('Items array required for update');
-            }
-
-            // Validate new items
-            $item_ids = array_column($items, 'item_id');
-            $placeholders = str_repeat('?,', count($item_ids) - 1) . '?';
-            $stmt = $conn->prepare("
-                SELECT id, item_name, price 
-                FROM menu_items 
-                WHERE id IN ($placeholders) 
-                  AND restaurant_id = ? 
-                  AND status = 'available'
-            ");
-            $types = str_repeat('i', count($item_ids)) . 'i';
-            $params = array_merge($item_ids, [$restaurant_id]);
-            $stmt->bind_param($types, ...$params);
-            $stmt->execute();
-            $result = $stmt->get_result();
-
-            $menu_data = [];
-            while ($row = $result->fetch_assoc()) {
-                $menu_data[$row['id']] = [
-                    'name' => $row['item_name'],
-                    'price' => (float)$row['price']
-                ];
-            }
-            $stmt->close();
-
-            if (count($menu_data) !== count(array_unique($item_ids))) {
-                throw new Exception('One or more items invalid or unavailable');
-            }
-
-            // Prepare new items & total
-            $new_order_items = [];
-            $new_total = 0.0;
-
-            foreach ($items as $it) {
-                $item_id = (int)($it['item_id'] ?? 0);
-                $qty = max(1, (int)($it['quantity'] ?? 1));
-                $notes = trim($it['notes'] ?? '');
-
-                if (!isset($menu_data[$item_id])) continue;
-
-                $price = $menu_data[$item_id]['price'];
-                $new_total += $price * $qty;
-
-                $new_order_items[] = [
-                    'item_id' => $item_id,
-                    'quantity' => $qty,
-                    'notes' => $notes
-                ];
-            }
-
-            if (empty($new_order_items)) {
-                throw new Exception('No valid items in update');
-            }
-
-            // Stock delta (aligned with web version)
-            $old_map = [];
-            foreach ($current_items as $ci) {
-                $old_map[(int)$ci['item_id']] = (int)$ci['quantity'];
-            }
-
-            $new_map = [];
-            foreach ($new_order_items as $ni) {
-                $new_map[$ni['item_id']] = $ni['quantity'];
-            }
-
-            $all_ids = array_unique(array_merge(array_keys($old_map), array_keys($new_map)));
-
-            foreach ($all_ids as $item_id) {
-                $old_qty = $old_map[$item_id] ?? 0;
-                $new_qty = $new_map[$item_id] ?? 0;
-                $delta = $new_qty - $old_qty;
-
-                if ($delta == 0) continue;
-
-                $name_stmt = $conn->prepare("SELECT item_name FROM menu_items WHERE id = ? AND restaurant_id = ?");
-                $name_stmt->bind_param("ii", $item_id, $restaurant_id);
-                $name_stmt->execute();
-                $name_res = $name_stmt->get_result();
-                $name_row = $name_res->fetch_assoc();
-                $name_stmt->close();
-
-                $stock_name = $name_row['item_name'] ?? null;
-                if (!$stock_name) continue;
-
-                $check = $conn->prepare("SELECT quantity FROM stock_inventory WHERE restaurant_id = ? AND stock_name = ? FOR UPDATE");
-                $check->bind_param("is", $restaurant_id, $stock_name);
-                $check->execute();
-                $stock_res = $check->get_result();
-
-                if ($stock_res->num_rows > 0) {
-                    $current = (int)$stock_res->fetch_assoc()['quantity'];
-
-                    if ($delta > 0 && $current < $delta) {
-                        throw new Exception("Insufficient stock for '$stock_name' (need +$delta, have $current)");
-                    }
-
-                    $upd = $conn->prepare("UPDATE stock_inventory SET quantity = quantity + ? WHERE restaurant_id = ? AND stock_name = ?");
-                    $upd->bind_param("iis", $delta, $restaurant_id, $stock_name);
-                    $upd->execute();
-                    $upd->close();
-                }
-                $check->close();
-            }
-
-            // Update order
-            $items_json = json_encode($new_order_items);
-
-            $upd = $conn->prepare("
-                UPDATE orders 
-                SET table_number = ?, items = ?, total_amount = ? 
-                WHERE id = ? AND restaurant_id = ?
-            ");
-            $upd->bind_param("ssdii", $table_identifier, $items_json, $new_total, $order_id, $restaurant_id);
-            $upd->execute();
-            $upd->close();
-
-            $conn->commit();
-
-            echo json_encode([
-                'success' => true,
-                'message' => 'Order updated successfully',
-                'new_total' => $new_total
-            ]);
+            echo json_encode(['success' => true, 'message' => 'Order deleted successfully']);
+            exit;
         }
+
+        // ─── UPDATE ────────────────────────────────────────────────────
+        if (empty($table_identifier)) {
+            throw new Exception('Table identifier required');
+        }
+        if (empty($items) || !is_array($items)) {
+            throw new Exception('Items required');
+        }
+
+        // Validate items
+        $item_ids = array_column($items, 'item_id');
+        if (empty($item_ids)) {
+            throw new Exception('No items provided');
+        }
+
+        $placeholders = implode(',', array_fill(0, count($item_ids), '?'));
+        $stmt = $conn->prepare("
+            SELECT id, item_name, price FROM menu_items 
+            WHERE id IN ($placeholders) 
+              AND restaurant_id = ? 
+              AND status = 'available'
+        ");
+        $types = str_repeat('i', count($item_ids)) . 'i';
+        $params = array_merge($item_ids, [$restaurant_id]);
+        $stmt->bind_param($types, ...$params);
+        $stmt->execute();
+        $result = $stmt->get_result();
+
+        $menu_data = [];
+        while ($row = $result->fetch_assoc()) {
+            $menu_data[$row['id']] = [
+                'name' => $row['item_name'],
+                'price' => (float)$row['price']
+            ];
+        }
+        $stmt->close();
+
+        if (count($menu_data) !== count(array_unique($item_ids))) {
+            throw new Exception('One or more items invalid or unavailable');
+        }
+
+        // Prepare new items & total
+        $new_order_items = [];
+        $new_total = 0.0;
+
+        foreach ($items as $it) {
+            $item_id = (int)($it['item_id'] ?? 0);
+            $qty = max(1, (int)($it['quantity'] ?? 1));
+            $notes = trim($it['notes'] ?? '');
+
+            if (!isset($menu_data[$item_id])) continue;
+
+            $price = $menu_data[$item_id]['price'];
+            $new_total += $price * $qty;
+
+            $new_order_items[] = [
+                'item_id' => $item_id,
+                'quantity' => $qty,
+                'notes' => $notes
+            ];
+        }
+
+        if (empty($new_order_items)) {
+            throw new Exception('No valid items in update');
+        }
+
+        // ─── STOCK ADJUSTMENT ──────────────────────────────────────────
+        $old_map = [];
+        foreach ($current_items as $ci) {
+            $old_map[(int)$ci['item_id']] = (int)$ci['quantity'];
+        }
+
+        $new_map = [];
+        foreach ($new_order_items as $ni) {
+            $new_map[$ni['item_id']] = $ni['quantity'];
+        }
+
+        $all_ids = array_unique(array_merge(array_keys($old_map), array_keys($new_map)));
+
+        foreach ($all_ids as $item_id) {
+            $old_qty = $old_map[$item_id] ?? 0;
+            $new_qty = $new_map[$item_id] ?? 0;
+
+            if ($old_qty === $new_qty) continue;
+
+            $name_stmt = $conn->prepare("SELECT item_name FROM menu_items WHERE id = ? AND restaurant_id = ?");
+            $name_stmt->bind_param("ii", $item_id, $restaurant_id);
+            $name_stmt->execute();
+            $name_res = $name_stmt->get_result();
+            $name_row = $name_res->fetch_assoc();
+            $name_stmt->close();
+
+            $stock_name = $name_row['item_name'] ?? null;
+            if (!$stock_name) continue;
+
+            $check = $conn->prepare("
+                SELECT quantity FROM stock_inventory 
+                WHERE restaurant_id = ? AND stock_name = ?
+                FOR UPDATE
+            ");
+            $check->bind_param("is", $restaurant_id, $stock_name);
+            $check->execute();
+            $stock_res = $check->get_result();
+
+            if ($stock_res->num_rows > 0) {
+                $row = $stock_res->fetch_assoc();
+                $current_stock = (int)$row['quantity'];
+
+                $difference = abs($new_qty - $old_qty);
+
+                if ($new_qty > $old_qty) {
+                    // Increasing → consume more stock
+                    if ($current_stock < $difference) {
+                        throw new Exception("Insufficient stock for '{$stock_name}': need {$difference} more, have {$current_stock}");
+                    }
+                    $adjust_stmt = $conn->prepare("
+                        UPDATE stock_inventory 
+                        SET quantity = quantity - ? 
+                        WHERE restaurant_id = ? AND stock_name = ?
+                    ");
+                    $adjust_stmt->bind_param("iis", $difference, $restaurant_id, $stock_name);
+                } else {
+                    // Decreasing → restore stock
+                    $adjust_stmt = $conn->prepare("
+                        UPDATE stock_inventory 
+                        SET quantity = quantity + ? 
+                        WHERE restaurant_id = ? AND stock_name = ?
+                    ");
+                    $adjust_stmt->bind_param("iis", $difference, $restaurant_id, $stock_name);
+                }
+
+                $adjust_stmt->execute();
+                $adjust_stmt->close();
+            }
+            $check->close();
+        }
+
+        // Update order
+        $items_json = json_encode($new_order_items);
+
+        $upd = $conn->prepare("
+            UPDATE orders 
+            SET table_number = ?, items = ?, total_amount = ? 
+            WHERE id = ? AND restaurant_id = ?
+        ");
+        $upd->bind_param("ssdii", $table_identifier, $items_json, $new_total, $order_id, $restaurant_id);
+        $upd->execute();
+        $upd->close();
+
+        $conn->commit();
+
+        echo json_encode([
+            'success' => true,
+            'message' => 'Order updated successfully',
+            'new_total' => $new_total
+        ]);
     } catch (Exception $e) {
         $conn->rollback();
         http_response_code(400);
