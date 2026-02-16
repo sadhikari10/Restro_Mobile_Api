@@ -76,7 +76,7 @@ try {
     $to_date   = trim($_GET['to_date'] ?? '');
 
     // Build WHERE clause
-    $where = "WHERE restaurant_id = ? AND status != 'completed' AND status != 'cancelled'";
+    $where = "WHERE restaurant_id = ? AND status = 'preparing'";
     $params = [$restaurant_id];
     $types = 'i';
 
