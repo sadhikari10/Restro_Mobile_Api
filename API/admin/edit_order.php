@@ -20,37 +20,7 @@ use Firebase\JWT\Key;
 require_once '../../Common/connection.php';
 require_once '../../Common/nepali_date.php';
 
-// Helper Function: Adjust stock (Add or Subtract)
-function adjustStock($conn, $restaurant_id, $stock_name, $delta) {
-    if ($delta == 0) return;
-
-    $check = $conn->prepare("
-        SELECT quantity FROM stock_inventory 
-        WHERE restaurant_id = ? AND stock_name = ?
-        FOR UPDATE
-    ");
-    $check->bind_param("is", $restaurant_id, $stock_name);
-    $check->execute();
-    $res = $check->get_result();
-
-    if ($row = $res->fetch_assoc()) {
-        $current = (int)$row['quantity'];
-        if ($delta < 0 && $current < abs($delta)) {
-            throw new Exception("Insufficient stock for $stock_name");
-        }
-
-        $upd = $conn->prepare("
-            UPDATE stock_inventory 
-            SET quantity = quantity + ? 
-            WHERE restaurant_id = ? AND stock_name = ?
-        ");
-        $upd->bind_param("iis", $delta, $restaurant_id, $stock_name);
-        $upd->execute();
-        $upd->close();
-    }
-    $check->close();
-}
-
+// JWT Secret
 $JWT_SECRET = $_ENV['JWT_SECRET'] ?? null;
 if (empty($JWT_SECRET)) {
     http_response_code(500);
@@ -112,7 +82,7 @@ try {
         exit;
     }
 
-    // Fetch current order data for audit logging
+    // Fetch current order data for audit logging and stock comparison
     $stmt = $conn->prepare("
         SELECT table_number, items, total_amount 
         FROM orders 
@@ -161,13 +131,45 @@ try {
             $del->execute();
             $del->close();
 
-            // Return stock
+            // Return stock for all items in the order
             foreach ($current_items as $ci) {
-                $name = $ci['item_name'] ?? '';
-                $qty  = (int)($ci['quantity'] ?? 0);
-                if ($qty > 0 && $name) {
-                    adjustStock($conn, $restaurant_id, $name, $qty);
+                $item_id = (int)($ci['item_id'] ?? 0);
+                $qty     = (int)($ci['quantity'] ?? 0);
+
+                if ($qty <= 0 || $item_id <= 0) continue;
+
+                $nameStmt = $conn->prepare("
+                    SELECT item_name FROM menu_items 
+                    WHERE id = ? AND restaurant_id = ?
+                ");
+                $nameStmt->bind_param("ii", $item_id, $restaurant_id);
+                $nameStmt->execute();
+                $nameRow = $nameStmt->get_result()->fetch_assoc();
+                $nameStmt->close();
+
+                $stock_name = $nameRow['item_name'] ?? null;
+                if (!$stock_name) continue;
+
+                $check = $conn->prepare("
+                    SELECT quantity FROM stock_inventory 
+                    WHERE restaurant_id = ? AND stock_name = ?
+                    FOR UPDATE
+                ");
+                $check->bind_param("is", $restaurant_id, $stock_name);
+                $check->execute();
+                $res = $check->get_result();
+
+                if ($res->num_rows > 0) {
+                    $restore = $conn->prepare("
+                        UPDATE stock_inventory 
+                        SET quantity = quantity + ? 
+                        WHERE restaurant_id = ? AND stock_name = ?
+                    ");
+                    $restore->bind_param("iis", $qty, $restaurant_id, $stock_name);
+                    $restore->execute();
+                    $restore->close();
                 }
+                $check->close();
             }
 
             $conn->commit();
@@ -185,9 +187,14 @@ try {
         $menu_data = [];
         if (!empty($item_ids)) {
             $placeholders = implode(',', array_fill(0, count($item_ids), '?'));
-            $m_stmt = $conn->prepare("SELECT id, item_name, price FROM menu_items WHERE restaurant_id = ? AND id IN ($placeholders)");
+            $m_stmt = $conn->prepare("
+                SELECT id, item_name, price 
+                FROM menu_items 
+                WHERE restaurant_id = ? AND id IN ($placeholders) AND status = 'available'
+            ");
             $types = 'i' . str_repeat('i', count($item_ids));
-            $m_stmt->bind_param($types, $restaurant_id, ...$item_ids);
+            $m_params = array_merge([$restaurant_id], $item_ids);
+            $m_stmt->bind_param($types, ...$m_params);
             $m_stmt->execute();
             $m_res = $m_stmt->get_result();
             while ($row = $m_res->fetch_assoc()) {
@@ -215,28 +222,81 @@ try {
             throw new Exception('No valid items found');
         }
 
-        // Calculate stock delta
-        $stock_deltas = [];
-        foreach ($new_items as $ni) {
-            $name = $menu_data[$ni['item_id']]['item_name'];
-            $new_qty = $ni['quantity'];
-
-            $old_qty = 0;
-            foreach ($current_items as $ci) {
-                if (($ci['item_id'] ?? 0) == $ni['item_id']) {
-                    $old_qty = (int)($ci['quantity'] ?? 0);
-                    break;
-                }
-            }
-            $delta = $new_qty - $old_qty;
-            if ($delta != 0) {
-                $stock_deltas[$name] = $delta;
-            }
+        // === STOCK ADJUSTMENT – same explicit logic as staff version ===
+        $id_to_old = [];
+        foreach ($current_items as $ci) {
+            $id_to_old[(int)($ci['item_id'] ?? 0)] = (int)($ci['quantity'] ?? 0);
         }
 
-        // Apply stock changes
-        foreach ($stock_deltas as $name => $delta) {
-            adjustStock($conn, $restaurant_id, $name, $delta);
+        $id_to_new = [];
+        foreach ($new_items as $ni) {
+            $id_to_new[$ni['item_id']] = $ni['quantity'];
+        }
+
+        $all_item_ids = array_unique(array_merge(array_keys($id_to_old), array_keys($id_to_new)));
+
+        foreach ($all_item_ids as $menu_item_id) {
+            $old_qty = $id_to_old[$menu_item_id] ?? 0;
+            $new_qty = $id_to_new[$menu_item_id] ?? 0;
+
+            if ($old_qty === $new_qty) {
+                continue;
+            }
+
+            // Get item name
+            $nameStmt = $conn->prepare("
+                SELECT item_name FROM menu_items 
+                WHERE id = ? AND restaurant_id = ?
+            ");
+            $nameStmt->bind_param("ii", $menu_item_id, $restaurant_id);
+            $nameStmt->execute();
+            $nameRow = $nameStmt->get_result()->fetch_assoc();
+            $nameStmt->close();
+
+            $stock_name = $nameRow['item_name'] ?? null;
+            if (!$stock_name) continue;
+
+            // Lock & check if tracked
+            $check = $conn->prepare("
+                SELECT quantity FROM stock_inventory 
+                WHERE restaurant_id = ? AND stock_name = ?
+                FOR UPDATE
+            ");
+            $check->bind_param("is", $restaurant_id, $stock_name);
+            $check->execute();
+            $stock_res = $check->get_result();
+
+            if ($stock_res->num_rows > 0) {
+                $row = $stock_res->fetch_assoc();
+                $current_stock = (int)$row['quantity'];
+
+                $difference = abs($new_qty - $old_qty);
+
+                if ($new_qty > $old_qty) {
+                    // Increasing quantity → consume more
+                    if ($current_stock < $difference) {
+                        throw new Exception("Insufficient stock for {$stock_name}: need {$difference} more, have {$current_stock}");
+                    }
+                    $adjust_stmt = $conn->prepare("
+                        UPDATE stock_inventory 
+                        SET quantity = quantity - ? 
+                        WHERE restaurant_id = ? AND stock_name = ?
+                    ");
+                    $adjust_stmt->bind_param("iis", $difference, $restaurant_id, $stock_name);
+                } else {
+                    // Decreasing quantity / removing → restore
+                    $adjust_stmt = $conn->prepare("
+                        UPDATE stock_inventory 
+                        SET quantity = quantity + ? 
+                        WHERE restaurant_id = ? AND stock_name = ?
+                    ");
+                    $adjust_stmt->bind_param("iis", $difference, $restaurant_id, $stock_name);
+                }
+
+                $adjust_stmt->execute();
+                $adjust_stmt->close();
+            }
+            $check->close();
         }
 
         // Update main order
