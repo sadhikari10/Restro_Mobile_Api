@@ -237,7 +237,7 @@ try {
             throw new Exception('No valid items in update');
         }
 
-        // ── Stock delta adjustment (exact same logic as web) ─────
+        // ── Stock adjustment using if-else ───────────────────────
         $id_to_old = [];
         foreach ($current_items as $ci) {
             $id_to_old[(int)$ci['item_id']] = (int)$ci['quantity'];
@@ -253,11 +253,12 @@ try {
         foreach ($all_item_ids as $menu_item_id) {
             $old_qty = $id_to_old[$menu_item_id] ?? 0;
             $new_qty = $id_to_new[$menu_item_id] ?? 0;
-            $delta   = $new_qty - $old_qty;
 
-            if ($delta == 0) continue;
+            if ($old_qty === $new_qty) {
+                continue;
+            }
 
-            // Get name
+            // Get item name
             $nameStmt = $conn->prepare("SELECT item_name FROM menu_items WHERE id = ? AND restaurant_id = ?");
             $nameStmt->bind_param("ii", $menu_item_id, $restaurant_id);
             $nameStmt->execute();
@@ -267,7 +268,7 @@ try {
             $stock_name = $nameRow['item_name'] ?? null;
             if (!$stock_name) continue;
 
-            // Only touch if tracked
+            // Check if this item is tracked in inventory
             $check = $conn->prepare("
                 SELECT quantity FROM stock_inventory 
                 WHERE restaurant_id = ? AND stock_name = ?
@@ -279,25 +280,38 @@ try {
 
             if ($stock_res->num_rows > 0) {
                 $sr = $stock_res->fetch_assoc();
-                $current = (int)$sr['quantity'];
+                $current_stock = (int)$sr['quantity'];
 
-                if ($delta > 0 && $current < $delta) {
-                    throw new Exception("Insufficient stock for {$stock_name}: need +{$delta}, have {$current}");
+                $difference = abs($new_qty - $old_qty);
+
+                if ($new_qty > $old_qty) {
+                    // Case 1: Increasing quantity → consume more stock
+                    if ($current_stock < $difference) {
+                        throw new Exception("Insufficient stock for {$stock_name}: need {$difference} more, have {$current_stock}");
+                    }
+                    $stmt = $conn->prepare("
+                        UPDATE stock_inventory 
+                        SET quantity = quantity - ? 
+                        WHERE restaurant_id = ? AND stock_name = ?
+                    ");
+                    $stmt->bind_param("iis", $difference, $restaurant_id, $stock_name);
+                } else {
+                    // Case 2: Decreasing quantity → restore stock
+                    $stmt = $conn->prepare("
+                        UPDATE stock_inventory 
+                        SET quantity = quantity + ? 
+                        WHERE restaurant_id = ? AND stock_name = ?
+                    ");
+                    $stmt->bind_param("iis", $difference, $restaurant_id, $stock_name);
                 }
 
-                $upd = $conn->prepare("
-                    UPDATE stock_inventory 
-                    SET quantity = quantity + ? 
-                    WHERE restaurant_id = ? AND stock_name = ?
-                ");
-                $upd->bind_param("iis", $delta, $restaurant_id, $stock_name);
-                $upd->execute();
-                $upd->close();
+                $stmt->execute();
+                $stmt->close();
             }
             $check->close();
         }
 
-        // ── Update order (only existing fields) ─────────────────
+        // ── Update order ─────────────────────────────────────────
         $items_json = json_encode($new_order_items);
 
         $upd_stmt = $conn->prepare("
