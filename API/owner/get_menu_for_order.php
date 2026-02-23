@@ -37,12 +37,6 @@ if ($_SERVER['REQUEST_METHOD'] !== 'GET') {
 // ────────────────────────────────────────────────
 $headers = getallheaders();
 
-// Log all possible header locations
-error_log("DEBUG: All getallheaders(): " . json_encode($headers));
-error_log("DEBUG: HTTP_AUTHORIZATION in \$_SERVER: " . ($_SERVER['HTTP_AUTHORIZATION'] ?? 'NOT SET'));
-error_log("DEBUG: REDIRECT_HTTP_AUTHORIZATION in \$_SERVER: " . ($_SERVER['REDIRECT_HTTP_AUTHORIZATION'] ?? 'NOT SET'));
-error_log("DEBUG: Authorization in headers: " . ($headers['Authorization'] ?? 'NOT SET'));
-error_log("DEBUG: authorization in headers: " . ($headers['authorization'] ?? 'NOT SET'));
 
 $token = null;
 
@@ -83,10 +77,8 @@ if (!$token) {
 // Extract Bearer token
 if ($token && preg_match('/Bearer\s+(.+)/i', $token, $matches)) {
     $token = trim($matches[1]);
-    error_log("DEBUG: Token successfully extracted: " . substr($token, 0, 20) . '...');
 } else {
     $token = null;
-    error_log("DEBUG: No Bearer token found in any header");
 }
 
 if (empty($token)) {
