@@ -241,7 +241,8 @@ $stmt->close();
                     </div>
                     <div class="col-md-6">
                         <label class="form-label">Phone</label>
-                        <input type="text" name="phone" class="form-control">
+                        <input type="text" name="phone" class="form-control" value="<?= htmlspecialchars($form_data['phone'] ?? '') ?>"
+           required>
                     </div>
                 </div>
                 <div class="row g-3 mt-1">
