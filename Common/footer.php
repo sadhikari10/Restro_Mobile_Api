@@ -65,7 +65,7 @@
     <p>Restaurant Management System &copy; <?= date('Y') ?>.</p>
     <p>
       <a href="../Common/terms.php" target="_blank">Terms & Conditions</a> | 
-      <a href="../Common/privacy_policy.php" target="_blank">Privacy Policy</a> | 
+      <a href="../Common/privac_policy.php" target="_blank">Privacy Policy</a> | 
       <a href="../Common/suggestions.php">Suggestions</a> | 
       <a href="../Common/issues_center.php">Issue Center</a> |
       Support: +977-9840032900
