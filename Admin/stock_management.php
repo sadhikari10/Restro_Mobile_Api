@@ -62,6 +62,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $transaction_date_bs = trim($_POST['transaction_date_bs'] ?? '');
         $discount            = floatval($_POST['discount'] ?? 0);
         $vat_percent         = ($_POST['vat_option'] ?? '') === '13' ? 13 : 0;
+        $is_credit = isset($_POST['is_credit']) ? (int)$_POST['is_credit'] : 0;
 
         if (!$company_name || !$bill_no || !$transaction_date_bs) {
             throw new Exception("Company name, Bill number and Transaction date are required.");
@@ -140,13 +141,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             "INSERT INTO purchase 
                 (restaurant_id, bill_no, company_name, vat_no, address, transaction_date,
                  fiscal_year, added_by, created_at, items_json, total_amount, discount,
-                 taxable_amount, vat_percent, net_total)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                 taxable_amount, vat_percent, net_total, is_credit)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         );
         if (!$ins) throw new Exception("Prepare failed: " . $conn->error);
 
         $ins->bind_param(
-            'iisssssisssdddi',  // 15 types
+            'iisssssisssdddii',  // 15 types
             $restaurant_id, 
             $bill_no,
             $company_name,
@@ -161,7 +162,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $discount,
             $taxable,
             $vat_percent,
-            $net_total
+            $net_total,
+            $is_credit
         );
 
         if (!$ins->execute()) {
@@ -264,7 +266,8 @@ $st->close();
             'grand_total'         => 0,
             'net_total'           => 0,
             'fiscal_year'         => $fiscal_year ?? get_fiscal_year($transaction_date_bs ?? $today_bs),
-            'added_by'            => $added_by
+            'added_by'            => $added_by,
+            'is_credit'           => 0
         ];
 
         $names = $_POST['item_name'] ?? [];
@@ -447,6 +450,23 @@ $st->close();
                 <label class="form-label">Net Total</label>
                 <input type="number" id="net_total" class="form-control"
                        value="<?=number_format($prefill['net_total'],2,'.','')?>" readonly>
+            </div>
+        </div>
+        <div class="row g-3 mt-2">
+            <div class="col-md-3">
+                <label class="form-label d-block">Purchase Type</label>
+
+                <div class="form-check form-check-inline">
+                    <input class="form-check-input" type="radio" name="is_credit" value="0"
+                        <?= (isset($prefill['is_credit']) ? $prefill['is_credit'] : 0) == 0 ? 'checked' : '' ?>>
+                    <label class="form-check-label">Cash</label>
+                </div>
+
+                <div class="form-check form-check-inline">
+                    <input class="form-check-input" type="radio" name="is_credit" value="1"
+                        <?= (isset($prefill['is_credit']) && $prefill['is_credit'] == 1) ? 'checked' : '' ?>>
+                    <label class="form-check-label">Credit</label>
+                </div>
             </div>
         </div>
 
