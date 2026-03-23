@@ -22,6 +22,31 @@ $user_id       = (int)$_SESSION['user_id'];
 $message       = $_SESSION['message'] ?? '';
 unset($_SESSION['message']);
 
+// Handle "Mark as Paid" action (same page)
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'mark_paid') {
+    $purchase_id = (int)($_POST['purchase_id'] ?? 0);
+
+    if ($purchase_id > 0) {
+        $stmt = $conn->prepare("UPDATE purchase 
+                                SET is_credit = 0 
+                                WHERE id = ? AND restaurant_id = ? AND is_credit = 1");
+        $stmt->bind_param("ii", $purchase_id, $restaurant_id);
+        $stmt->execute();
+
+        if ($stmt->affected_rows > 0) {
+            $_SESSION['message'] = "<div class='alert alert-success'>Credit cleared successfully (marked as paid).</div>";
+        } else {
+            $_SESSION['message'] = "<div class='alert alert-warning'>No change – already paid or not found.</div>";
+        }
+        $stmt->close();
+    } else {
+        $_SESSION['message'] = "<div class='alert alert-danger'>Invalid request.</div>";
+    }
+
+    header("Location: view_stock.php");
+    exit;
+}
+
 $today_ad         = date('Y-m-d');
 $today_bs         = ad_to_bs($today_ad);
 $one_month_ago_ad = date('Y-m-d', strtotime('-1 month'));
@@ -66,7 +91,7 @@ while ($p = $result->fetch_assoc()) {
     $purchases[] = $p;
 }
 
-// ====================== EDIT PURCHASE (WITH NEGATIVE STOCK PREVENTION) ======================
+// ====================== EDIT PURCHASE (unchanged) ======================
 if (isset($_POST['action']) && $_POST['action'] === 'save_purchase_edit') {
     $conn->autocommit(false);
     try {
@@ -84,7 +109,6 @@ if (isset($_POST['action']) && $_POST['action'] === 'save_purchase_edit') {
         $old_items = json_decode($current['items_json'] ?? '[]', true) ?? [];
         $now_bs    = nepali_date_time();
 
-        // New values
         $bill_no             = trim($_POST['bill_no'] ?? '');
         $company_name        = trim($_POST['company_name'] ?? '');
         $vat_no              = trim($_POST['vat_no'] ?? '');
@@ -99,7 +123,6 @@ if (isset($_POST['action']) && $_POST['action'] === 'save_purchase_edit') {
 
         $fiscal_year = get_fiscal_year($transaction_date_bs);
 
-        // DUPLICATE BILL CHECK (Same as stock_management.php)
         $chk = $conn->prepare("SELECT id FROM purchase 
             WHERE restaurant_id = ? 
               AND company_name = ? 
@@ -114,7 +137,6 @@ if (isset($_POST['action']) && $_POST['action'] === 'save_purchase_edit') {
         }
         $chk->close();
 
-        // Save to history
         $hist = $conn->prepare("INSERT INTO purchase_history 
             (purchase_id, restaurant_id, edited_by, edited_at, edit_reason, bill_no, company_name, vat_no, address,
              transaction_date, fiscal_year, items_json, total_amount, discount, taxable_amount, vat_percent, net_total)
@@ -125,7 +147,6 @@ if (isset($_POST['action']) && $_POST['action'] === 'save_purchase_edit') {
         $hist->execute();
         $hist->close();
 
-        // Process items
         $new_items    = [];
         $total_amount = 0;
         foreach (($_POST['item_name'] ?? []) as $i => $name) {
@@ -153,7 +174,6 @@ if (isset($_POST['action']) && $_POST['action'] === 'save_purchase_edit') {
         $net_total = $vat_percent == 13 ? round($taxable * 1.13, 2) : $taxable;
         $items_json = json_encode($new_items, JSON_UNESCAPED_UNICODE);
 
-        // Update stock WITH NEGATIVE STOCK PREVENTION
         $stock_sql = "INSERT INTO stock_inventory (restaurant_id, stock_name, quantity, unit, updated_at)
                       VALUES (?, ?, ?, ?, ?)
                       ON DUPLICATE KEY UPDATE 
@@ -162,13 +182,11 @@ if (isset($_POST['action']) && $_POST['action'] === 'save_purchase_edit') {
                           updated_at = VALUES(updated_at)";
         $st = $conn->prepare($stock_sql);
 
-        // FIRST: Remove old items (check for negative stock)
         foreach ($old_items as $it) {
             $name = $it['name'];
             $qty = -$it['quantity'];
             $unit = $it['unit'];
 
-            // CHECK CURRENT STOCK BEFORE REMOVING
             $check_stmt = $conn->prepare("SELECT quantity FROM stock_inventory WHERE restaurant_id = ? AND stock_name = ?");
             $check_stmt->bind_param("is", $restaurant_id, $name);
             $check_stmt->execute();
@@ -184,14 +202,12 @@ if (isset($_POST['action']) && $_POST['action'] === 'save_purchase_edit') {
             $st->execute();
         }
 
-        // THEN: Add new items
         foreach ($new_items as $it) {
             $st->bind_param("isdss", $restaurant_id, $it['name'], $it['quantity'], $it['unit'], $now_bs);
             $st->execute();
         }
         $st->close();
 
-        // Update purchase
         $upd = $conn->prepare("UPDATE purchase SET 
             bill_no = ?, company_name = ?, vat_no = ?, address = ?, transaction_date = ?, fiscal_year = ?,
             items_json = ?, total_amount = ?, discount = ?, taxable_amount = ?, vat_percent = ?, net_total = ?, created_at = ?
@@ -207,7 +223,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'save_purchase_edit') {
         $upd->close();
 
         $conn->commit();
-        $_SESSION['message'] = "Purchase updated successfully!";
+        $_SESSION['message'] = "<div class='alert alert-success'>Purchase updated successfully!</div>";
     } catch (Exception $e) {
         $conn->rollback();
         $msg = $e->getMessage();
@@ -283,13 +299,20 @@ if (isset($_POST['action']) && $_POST['action'] === 'save_purchase_edit') {
                 <table class="table table-hover align-middle">
                     <thead class="table-primary">
                         <tr>
-                            <th>#</th><th>Bill No</th><th>Company</th><th>Date (BS)</th>
-                            <th class="text-end">Net Total</th><th>Edits</th><th>Actions</th>
+                            <th>#</th>
+                            <th>Bill No</th>
+                            <th>Company</th>
+                            <th>Date (BS)</th>
+                            <th class="text-end">Net Total</th>
+                            <th>Edits</th>
+                            <th>Status</th>
+                            <th>Clear Credit</th>
+                            <th>Actions</th>
                         </tr>
                     </thead>
                     <tbody>
                         <?php if (empty($purchases)): ?>
-                            <tr><td colspan="7" class="text-center py-4 text-muted">No purchase entries found</td></tr>
+                            <tr><td colspan="9" class="text-center py-4 text-muted">No purchase entries found</td></tr>
                         <?php else: $i=1; foreach($purchases as $p): ?>
                         <tr>
                             <td><?= $i++ ?></td>
@@ -302,6 +325,27 @@ if (isset($_POST['action']) && $_POST['action'] === 'save_purchase_edit') {
                                     <span class="badge badge-edit"><?= $p['edit_count'] ?></span>
                                 <?php else: ?>—<?php endif; ?>
                             </td>
+                            <td class="text-center">
+                                <?php if (!empty($p['is_credit']) && $p['is_credit'] == 1): ?>
+                                    <span class="badge bg-danger">Credit</span>
+                                <?php else: ?>
+                                    <span class="badge bg-success">Paid</span>
+                                <?php endif; ?>
+                            </td>
+                            <td class="text-center">
+                                <?php if (isset($p['is_credit']) && $p['is_credit'] == 1): ?>
+                                    <button type="button" 
+                                            class="btn btn-success btn-sm confirm-paid-btn"
+                                            data-bs-toggle="modal"
+                                            data-bs-target="#confirmPaidModal"
+                                            data-purchase-id="<?= $p['id'] ?>"
+                                            data-bill-no="<?= htmlspecialchars($p['bill_no']) ?>">
+                                        Mark Paid
+                                    </button>
+                                <?php else: ?>
+                                    —
+                                <?php endif; ?>
+                            </td>
                             <td>
                                 <button class="btn btn-warning btn-sm" onclick="openEditModal(<?= $p['id'] ?>, <?= htmlspecialchars(json_encode($p), ENT_QUOTES) ?>)">Edit</button>
                                 <button class="btn btn-info btn-sm text-white" onclick="openHistoryModal(<?= $p['id'] ?>)">History</button>
@@ -311,7 +355,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'save_purchase_edit') {
                         <tr class="total-row">
                             <td colspan="4" class="text-end pe-4">GRAND TOTAL:</td>
                             <td class="text-end text-success">Rs <?= number_format($grand_total, 2) ?></td>
-                            <td colspan="2"></td>
+                            <td colspan="4"></td>
                         </tr>
                         <?php endif; ?>
                     </tbody>
@@ -319,6 +363,26 @@ if (isset($_POST['action']) && $_POST['action'] === 'save_purchase_edit') {
             </div>
             <div class="mt-3">
                 <a href="view_branch.php" class="btn btn-dark">Back</a>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Confirmation Modal for Mark Paid -->
+<div class="modal fade" id="confirmPaidModal" tabindex="-1" aria-labelledby="confirmPaidModalLabel" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content">
+            <div class="modal-header bg-primary text-white">
+                <h5 class="modal-title" id="confirmPaidModalLabel">Confirm Payment</h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body text-center">
+                <p class="fs-5 mb-4">Mark bill <strong id="billNoInModal"></strong> as PAID?</p>
+                <p class="text-muted">This action will clear the credit status.</p>
+            </div>
+            <div class="modal-footer justify-content-center gap-4">
+                <button type="button" class="btn btn-secondary btn-lg px-5" data-bs-dismiss="modal">No, Cancel</button>
+                <button type="button" class="btn btn-success btn-lg px-5" id="confirmYesBtn">Yes, Mark as Paid</button>
             </div>
         </div>
     </div>
@@ -525,6 +589,50 @@ function exportToExcel() {
     XLSX.utils.book_append_sheet(wb, ws, "History");
     XLSX.writeFile(wb, `Purchase_${document.getElementById('histId').textContent}_History.xlsx`);
 }
+// Handle confirmation modal for mark paid
+document.addEventListener('click', function(e) {
+    if (e.target.classList.contains('confirm-paid-btn')) {
+        const btn = e.target;
+        const purchaseId = btn.getAttribute('data-purchase-id');
+        const billNo = btn.getAttribute('data-bill-no');
+
+        // Fill modal with bill number
+        document.getElementById('billNoInModal').textContent = billNo;
+
+        // When user clicks Yes
+        const yesBtn = document.getElementById('confirmYesBtn');
+        
+        // Remove previous listener to avoid duplicates
+        yesBtn.replaceWith(yesBtn.cloneNode(true));
+        const newYesBtn = document.getElementById('confirmYesBtn');
+
+        newYesBtn.addEventListener('click', function() {
+            // Create and submit hidden form
+            const form = document.createElement('form');
+            form.method = 'POST';
+            form.action = 'view_stock.php';
+            form.style.display = 'none';
+
+            const actionInput = document.createElement('input');
+            actionInput.type = 'hidden';
+            actionInput.name = 'action';
+            actionInput.value = 'mark_paid';
+            form.appendChild(actionInput);
+
+            const idInput = document.createElement('input');
+            idInput.type = 'hidden';
+            idInput.name = 'purchase_id';
+            idInput.value = purchaseId;
+            form.appendChild(idInput);
+
+            document.body.appendChild(form);
+            form.submit();
+
+            // Optional: close modal immediately
+            bootstrap.Modal.getInstance(document.getElementById('confirmPaidModal')).hide();
+        });
+    }
+});
 </script>
 
 <?php include '../Common/footer.php'; ?>
