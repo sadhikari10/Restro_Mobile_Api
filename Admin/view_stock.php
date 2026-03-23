@@ -14,6 +14,52 @@ $user_id       = (int)$_SESSION['user_id'] ?? 0;
 $message       = $_SESSION['message'] ?? '';
 unset($_SESSION['message']);
 
+// Handle "Mark as Paid" (clear credit)
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'mark_paid') {
+    $purchase_id = (int)($_POST['purchase_id'] ?? 0);
+
+    if ($purchase_id > 0) {
+        $stmt = $conn->prepare("UPDATE purchase 
+                                SET is_credit = 0 
+                                WHERE id = ? AND restaurant_id = ? AND is_credit = 1");
+        $stmt->bind_param("ii", $purchase_id, $restaurant_id);
+        $stmt->execute();
+
+        if ($stmt->affected_rows > 0) {
+            $_SESSION['message'] = '
+            <div class="alert alert-success alert-dismissible fade show d-flex align-items-center shadow" role="alert">
+                <i class="bi bi-check-circle-fill me-3 fs-4"></i>
+                <div>
+                    <strong>Success!</strong> Credit marked as paid.
+                    <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+                </div>
+            </div>';
+        } else {
+            $_SESSION['message'] = '
+            <div class="alert alert-warning alert-dismissible fade show d-flex align-items-center" role="alert">
+                <i class="bi bi-exclamation-triangle-fill me-3 fs-4"></i>
+                <div>
+                    No change — already paid or not found.
+                    <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+                </div>
+            </div>';
+        }
+        $stmt->close();
+    } else {
+        $_SESSION['message'] = '
+        <div class="alert alert-danger alert-dismissible fade show d-flex align-items-center" role="alert">
+            <i class="bi bi-x-circle-fill me-3 fs-4"></i>
+            <div>
+                Invalid request. Please try again.
+                <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+            </div>
+        </div>';
+    }
+
+    header("Location: view_stock.php");
+    exit;
+}
+
 // Load restaurant name
 $restaurant_name = 'Restaurant';
 $stmt = $conn->prepare("SELECT name FROM restaurants WHERE id = ? LIMIT 1");
@@ -57,6 +103,7 @@ if ($start_date && $end_date) {
     $params[] = $end_date;
     $types .= "ss";
 }
+
 $stmt = $conn->prepare("
     SELECT 
         p.*, 
@@ -84,7 +131,7 @@ while ($p = $result->fetch_assoc()) {
 }
 $stmt->close();
 
-// ==================== DETAILED GROUPED EXCEL EXPORT WITH ORIGINAL CREATOR ====================
+// ==================== DETAILED GROUPED EXCEL EXPORT ====================
 if (isset($_POST['export_excel'])) {
     $restaurant_name_clean = trim(preg_replace('/[^a-zA-Z0-9\s\-]/', '', $restaurant_name)) ?: 'Restaurant';
     $clean_start = str_replace('-', '', $start_date);
@@ -94,7 +141,6 @@ if (isset($_POST['export_excel'])) {
     $spreadsheet = new \PhpOffice\PhpSpreadsheet\Spreadsheet();
     $sheet = $spreadsheet->getActiveSheet();
 
-    // Title & Info
     $sheet->setCellValue('A1', "STOCK PURCHASES DETAILED REGISTER");
     $sheet->mergeCells('A1:P1');
     $sheet->getStyle('A1')->getFont()->setSize(18)->setBold(true);
@@ -108,7 +154,6 @@ if (isset($_POST['export_excel'])) {
     $sheet->mergeCells('I2:P2');
     $sheet->getStyle('I2')->getFont()->setBold(true);
 
-    // Headers (Row 4)
     $headers = [
         'Bill No', 'Company Name', 'Date (BS)', 'VAT/PAN No', 'Address', 
         'Added By', 'Added On', 'Item Name', 'HS Code', 'Quantity', 
@@ -130,11 +175,10 @@ if (isset($_POST['export_excel'])) {
 
     foreach ($purchases as $purchase) {
         $items = json_decode($purchase['items_json'] ?? '[]', true) ?? [];
-        if (empty($items)) continue; // Skip empty bills if needed
+        if (empty($items)) continue;
 
         $billTotalBeforeDiscount = 0;
 
-        // === Header Row (only once per bill) ===
         $sheet->setCellValue('A' . $rowNum, $purchase['bill_no']);
         $sheet->setCellValue('B' . $rowNum, $purchase['company_name']);
         $sheet->setCellValue('C' . $rowNum, $purchase['transaction_date']);
@@ -150,7 +194,6 @@ if (isset($_POST['export_excel'])) {
 
         $rowNum++;
 
-        // === Item Rows ===
         foreach ($items as $it) {
             $qty = (float)($it['quantity'] ?? 0);
             $rate = (float)($it['rate'] ?? 0);
@@ -167,7 +210,6 @@ if (isset($_POST['export_excel'])) {
             $rowNum++;
         }
 
-        // === Bill Totals Row ===
         $vatText = ($purchase['vat_percent'] ?? 0) == 13 ? '13%' : '0%';
 
         $sheet->setCellValue('M' . $rowNum, 'Bill Total (before discount):');
@@ -183,10 +225,9 @@ if (isset($_POST['export_excel'])) {
 
         $overallGrandTotal += $purchase['net_total'];
 
-        $rowNum += 3; // Blank row + spacing after totals
+        $rowNum += 3;
     }
 
-    // === Grand Total ===
     $sheet->setCellValue('O' . $rowNum, 'GRAND TOTAL:');
     $sheet->setCellValue('P' . $rowNum, $overallGrandTotal);
     $sheet->getStyle("O{$rowNum}:P{$rowNum}")->getFont()->setBold(true)->setSize(14);
@@ -278,10 +319,24 @@ if ($_SERVER['REQUEST_METHOD']==='POST' && ($_POST['action'] ?? '') === 'save_pu
         $upd->execute();
         $upd->close();
         $conn->commit();
-        $_SESSION['message'] = "Purchase updated successfully!";
+        $_SESSION['message'] = '
+        <div class="alert alert-success alert-dismissible fade show d-flex align-items-center shadow" role="alert">
+            <i class="bi bi-check-circle-fill me-3 fs-4"></i>
+            <div>
+                <strong>Success!</strong> Purchase updated successfully!
+                <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+            </div>
+        </div>';
     } catch(Exception $e) {
         $conn->rollback();
-        $_SESSION['message'] = "Error: ".$e->getMessage();
+        $_SESSION['message'] = '
+        <div class="alert alert-danger alert-dismissible fade show d-flex align-items-center" role="alert">
+            <i class="bi bi-x-circle-fill me-3 fs-4"></i>
+            <div>
+                <strong>Error:</strong> '.$e->getMessage().'
+                <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+            </div>
+        </div>';
     }
     header("Location: view_stock.php");
     exit;
@@ -325,13 +380,15 @@ body{background: linear-gradient(135deg,#667eea 0%,#764ba2 100%);min-height:100v
 <div class="container py-4">
     <h3 class="text-center mb-4 text-white fw-bold">📦 View Stock Purchases</h3>
 
-    <div class="text-start mb-3">
-        <a href="dashboard.php" class="btn btn-secondary">&larr; Back to Dashboard</a>
-    </div>
-
     <?php if ($message): ?>
-        <div class="alert alert-info"><?= htmlspecialchars($message) ?></div>
+        <div class="mb-4">
+            <?= $message ?>
+        </div>
     <?php endif; ?>
+
+    <div class="text-start mb-3">
+        <a href="dashboard.php" class="btn btn-secondary">← Back to Dashboard</a>
+    </div>
 
     <div class="card shadow-sm mb-4">
         <div class="card-body">
@@ -365,6 +422,8 @@ body{background: linear-gradient(135deg,#667eea 0%,#764ba2 100%);min-height:100v
                     <th>Bill No</th>
                     <th>Items</th>
                     <th>Net Total (NPR)</th>
+                    <th>Status</th>
+                    <th>Clear Credit</th>
                     <th>Actions</th>
                 </tr>
             </thead>
@@ -389,6 +448,27 @@ body{background: linear-gradient(135deg,#667eea 0%,#764ba2 100%);min-height:100v
                             <td><?= htmlspecialchars($p['bill_no']) ?></td>
                             <td class="items-list"><?= htmlspecialchars($items_display) ?></td>
                             <td><strong><?= number_format($p['net_total'], 2) ?></strong></td>
+                            <td class="text-center">
+                                <?php if (isset($p['is_credit']) && $p['is_credit'] == 1): ?>
+                                    <span class="badge bg-danger">Credit</span>
+                                <?php else: ?>
+                                    <span class="badge bg-success">Paid</span>
+                                <?php endif; ?>
+                            </td>
+                            <td class="text-center">
+                                <?php if (isset($p['is_credit']) && $p['is_credit'] == 1): ?>
+                                    <button type="button" 
+                                            class="btn btn-success btn-sm confirm-paid-btn"
+                                            data-bs-toggle="modal"
+                                            data-bs-target="#confirmPaidModal"
+                                            data-purchase-id="<?= $p['id'] ?>"
+                                            data-bill-no="<?= htmlspecialchars($p['bill_no']) ?>">
+                                        Mark Paid
+                                    </button>
+                                <?php else: ?>
+                                    —
+                                <?php endif; ?>
+                            </td>
                             <td>
                                 <button class="btn btn-info btn-sm" onclick="openEditModal(<?= $p['id'] ?>, <?= htmlspecialchars(json_encode($p), ENT_QUOTES) ?>)">
                                     Edit
@@ -400,15 +480,34 @@ body{background: linear-gradient(135deg,#667eea 0%,#764ba2 100%);min-height:100v
                         </tr>
                     <?php endforeach; ?>
                     <tr>
-                        <td colspan="5" class="text-end fw-bold">Grand Total:</td>
-                        <td><strong class="text-success"><?= number_format($grand_total, 2) ?></strong></td>
-                        <td></td>
+                        <td colspan="6" class="text-end fw-bold">Grand Total:</td>
+                        <td colspan="3"><strong class="text-success"><?= number_format($grand_total, 2) ?></strong></td>
                     </tr>
                 <?php else: ?>
-                    <tr><td colspan="7" class="text-muted">No purchases found.</td></tr>
+                    <tr><td colspan="9" class="text-muted">No purchases found.</td></tr>
                 <?php endif; ?>
             </tbody>
         </table>
+    </div>
+</div>
+
+<!-- Confirmation Modal for Mark Paid -->
+<div class="modal fade" id="confirmPaidModal" tabindex="-1" aria-labelledby="confirmPaidModalLabel" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content">
+            <div class="modal-header bg-primary text-white">
+                <h5 class="modal-title" id="confirmPaidModalLabel">Confirm Payment</h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body text-center py-4">
+                <p class="fs-5 mb-3">Mark bill <strong id="billNoInModal"></strong> as PAID?</p>
+                <p class="text-muted small">This will clear the credit status for this purchase.</p>
+            </div>
+            <div class="modal-footer justify-content-center gap-4">
+                <button type="button" class="btn btn-secondary btn-lg px-5" data-bs-dismiss="modal">No, Cancel</button>
+                <button type="button" class="btn btn-success btn-lg px-5" id="confirmYesBtn">Yes, Mark as Paid</button>
+            </div>
+        </div>
     </div>
 </div>
 
@@ -452,6 +551,10 @@ body{background: linear-gradient(135deg,#667eea 0%,#764ba2 100%);min-height:100v
 function e(t) { const d = document.createElement('div'); d.textContent = t || ''; return d.innerHTML; }
 let currentHistoryData = [];
 
+// ────────────────────────────────────────────────
+// Existing functions (openEditModal, addRow, calcTotal, openHistoryModal, exportToExcel)
+// ────────────────────────────────────────────────
+
 function openEditModal(id, purchase) {
     document.getElementById('editId').textContent = id;
     let items = JSON.parse(purchase.items_json || '[]');
@@ -467,7 +570,7 @@ function openEditModal(id, purchase) {
             <td><button type="button" class="btn btn-danger btn-sm" onclick="this.closest('tr').remove(); calcTotal()">Remove</button></td>
         </tr>`;
     });
-    document.getElementById('editForm').innerHTML = `
+    document.getElementById('editBody').innerHTML = `
         <form method="post">
             <input type="hidden" name="action" value="save_purchase_edit">
             <input type="hidden" name="purchase_id" value="${id}">
@@ -513,7 +616,7 @@ function openEditModal(id, purchase) {
         el.addEventListener('change', calcTotal);
     });
     calcTotal();
-    new bootstrap.Modal('#editModal').show();
+    new bootstrap.Modal(document.getElementById('editModal')).show();
 }
 
 function addRow() {
@@ -629,82 +732,50 @@ function exportToExcel() {
     XLSX.utils.book_append_sheet(wb, ws, "History");
     XLSX.writeFile(wb, `Purchase_${document.getElementById('histId').textContent}_History.xlsx`);
 }
-</script>
-<script>
-function e(t) { 
-    const d = document.createElement('div'); 
-    d.textContent = t || ''; 
-    return d.innerHTML; 
-}
 
-function openEditModal(id, purchase) {
-    document.getElementById('editId').textContent = id;
-    let items = JSON.parse(purchase.items_json || '[]');
+// ────────────────────────────────────────────────
+// Handle Mark Paid confirmation modal
+// ────────────────────────────────────────────────
+document.addEventListener('click', function(e) {
+    if (!e.target.classList.contains('confirm-paid-btn')) return;
 
-    let rows = '';
-    items.forEach(it => {
-        rows += `<tr>
-            <td><input type="text" name="item_name[]" class="form-control form-control-sm" value="${e(it.name)}" required></td>
-            <td><input type="text" name="hs_code_item[]" class="form-control form-control-sm" value="${e(it.hs_code ?? '')}"></td>
-            <td><input type="number" step="0.001" name="quantity[]" class="form-control form-control-sm qty" value="${it.quantity}" required></td>
-            <td><input type="number" step="0.01" name="rate[]" class="form-control form-control-sm rate" value="${it.rate}" required></td>
-            <td><input type="text" name="unit[]" class="form-control form-control-sm" value="${e(it.unit)}" required></td>
-            <td class="total text-end fw-bold">0.00</td>
-            <td><button type="button" class="btn btn-danger btn-sm" onclick="this.closest('tr').remove(); calcTotal()">Remove</button></td>
-        </tr>`;
+    const btn = e.target;
+    const purchaseId = btn.getAttribute('data-purchase-id');
+    const billNo = btn.getAttribute('data-bill-no');
+
+    document.getElementById('billNoInModal').textContent = billNo;
+
+    const yesBtn = document.getElementById('confirmYesBtn');
+    yesBtn.replaceWith(yesBtn.cloneNode(true)); // prevent duplicate listeners
+    const newYesBtn = document.getElementById('confirmYesBtn');
+
+    newYesBtn.addEventListener('click', function() {
+        const form = document.createElement('form');
+        form.method = 'POST';
+        form.action = 'view_stock.php';
+        form.style.display = 'none';
+
+        form.innerHTML = `
+            <input type="hidden" name="action" value="mark_paid">
+            <input type="hidden" name="purchase_id" value="${purchaseId}">
+        `;
+
+        document.body.appendChild(form);
+        form.submit();
+
+        const modal = bootstrap.Modal.getInstance(document.getElementById('confirmPaidModal'));
+        if (modal) modal.hide();
     });
+});
 
-    document.getElementById('editBody').innerHTML = `
-        <form method="post">
-            <input type="hidden" name="action" value="save_purchase_edit">
-            <input type="hidden" name="purchase_id" value="${id}">
-            <div class="row g-3 mb-3">
-                <div class="col-md-3"><label>Bill No</label><input type="text" name="bill_no" class="form-control" value="${e(purchase.bill_no)}" required></div>
-                <div class="col-md-5"><label>Company Name</label><input type="text" name="company_name" class="form-control" value="${e(purchase.company_name)}" required></div>
-                <div class="col-md-4"><label>Date (BS)</label><input type="text" name="transaction_date" class="form-control" value="${purchase.transaction_date}" required></div>
-            </div>
-            <div class="row g-3 mb-3">
-                <div class="col-md-6"><label>VAT/PAN No</label><input type="text" name="vat_no" class="form-control" value="${e(purchase.vat_no ?? '')}"></div>
-                <div class="col-md-6"><label>Address</label><input type="text" name="address" class="form-control" value="${e(purchase.address ?? '')}"></div>
-            </div>
-            <hr>
-            <div class="mb-3">
-                <label class="text-danger fw-bold">Edit Reason (Required)</label>
-                <textarea name="edit_reason" class="form-control" rows="2" required placeholder="Why are you editing this purchase?"></textarea>
-            </div>
-            <div class="table-responsive mb-3">
-                <table class="table table-sm table-bordered">
-                    <thead class="table-light"><tr><th>Item</th><th>HS Code</th><th>Qty</th><th>Rate</th><th>Unit</th><th>Total</th><th></th></tr></thead>
-                    <tbody id="itemRows">${rows || '<tr><td colspan="7" class="text-center">No items</td></tr>'}</tbody>
-                </table>
-            </div>
-            <button type="button" class="btn btn-outline-primary btn-sm mb-3" onclick="addRow()">+ Add Item</button>
-            <div class="row g-3 mb-3">
-                <div class="col-md-4"><label>Discount</label><input type="number" step="0.01" id="discount" name="discount" class="form-control" value="${purchase.discount ?? 0}"></div>
-                <div class="col-md-4"><label>VAT</label>
-                    <select id="vat_option" name="vat_option" class="form-select">
-                        <option value="0" ${purchase.vat_percent == 0 ? 'selected' : ''}>0%</option>
-                        <option value="13" ${purchase.vat_percent == 13 ? 'selected' : ''}>13%</option>
-                    </select>
-                </div>
-                <div class="col-md-4 text-end">
-                    <h5>Net Total: <strong id="netTotal" class="text-success">0.00</strong> NPR</h5>
-                </div>
-            </div>
-            <div class="text-center">
-                <button type="submit" class="btn btn-success btn-lg">Save Changes</button>
-            </div>
-        </form>`;
-
-    // Re-attach event listeners
-    document.querySelectorAll('.qty, .rate, #discount, #vat_option').forEach(el => {
-        el.addEventListener('input', calcTotal);
-        el.addEventListener('change', calcTotal);
+// Optional: Auto-dismiss alerts after 6 seconds
+document.addEventListener('DOMContentLoaded', () => {
+    document.querySelectorAll('.alert-dismissible').forEach(alert => {
+        setTimeout(() => {
+            bootstrap.Alert.getOrCreateInstance(alert).close();
+        }, 6000);
     });
-    calcTotal();
-
-    new bootstrap.Modal(document.getElementById('editModal')).show();
-}
+});
 </script>
 </body>
 </html>
