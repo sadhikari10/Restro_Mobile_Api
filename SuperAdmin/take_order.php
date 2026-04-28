@@ -541,7 +541,7 @@ document.getElementById('reviewOrderBtn').addEventListener('click', function () 
         return;
     }
     if (!table) {
-        showCenterToast('Please enter Table Number or Customer Name / Phone.');
+        showCenterToast('Please select Table ');
         return;
     }
 
