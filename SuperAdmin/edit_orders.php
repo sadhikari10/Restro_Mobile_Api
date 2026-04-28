@@ -34,207 +34,121 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['order_id'])) {
     $order = $fetch->get_result()->fetch_assoc();
     $fetch->close();
 
-    if (!$order) {
-        $error_msg = "Order not found.";
-    } else {
+    if ($order) {
         $cur_items = json_decode($order['items'], true) ?? [];
         $current_qty = [];
         foreach ($cur_items as $item) {
             $current_qty[$item['item_id']] = $item['quantity'];
         }
 
+        // --- DELETE ORDER LOGIC ---
         if (isset($_POST['delete_order']) && $_POST['delete_order'] === '1') {
-            // === DELETE ORDER ===
-            try {
-                $conn->begin_transaction();
+            $reason = trim($_POST['delete_reason'] ?? '');
+            if (empty($reason)) {
+                $error_msg = "Delete failed: A reason is required.";
+            } else {
+                try {
+                    $conn->begin_transaction();
+                    
+                    // Archive with Reason
+                    $old_data = json_encode(['items' => $cur_items, 'total' => $order['total_amount']]);
+                    $change_time = nepali_date_time();
+                    $archive = $conn->prepare("INSERT INTO old_order (order_id, restaurant_id, changed_by, change_time, old_data, remarks) VALUES (?, ?, ?, ?, ?, ?)");
+                    $archive->bind_param("iiisss", $order_id, $restaurant_id, $user_id, $change_time, $old_data, $reason);
+                    $archive->execute();
 
-                $old_data = [
-                    'items' => $cur_items,
-                    'total_amount' => $order['total_amount'],
-                    'table_number' => $order['table_number'],
-                    'order_by' => $order['order_by'] ?? null
-                ];
-                $remarks = "Order deleted by superadmin";
-                $change_time = nepali_date_time();
-
-                $archive = $conn->prepare("INSERT INTO old_order (order_id, restaurant_id, changed_by, change_time, old_data, remarks) VALUES (?, ?, ?, ?, ?, ?)");
-                $json_old = json_encode($old_data);
-                $archive->bind_param("iiisss", $order_id, $restaurant_id, $user_id, $change_time, $json_old, $remarks);
-                $archive->execute();
-                $archive->close();
-
-                // Restore stock
-                foreach ($cur_items as $item) {
-                    $item_id = $item['item_id'];
-                    $qty = $item['quantity'];
-
-                    $name_stmt = $conn->prepare("SELECT item_name FROM menu_items WHERE id = ? AND restaurant_id = ?");
-                    $name_stmt->bind_param("ii", $item_id, $restaurant_id);
-                    $name_stmt->execute();
-                    $row = $name_stmt->get_result()->fetch_assoc();
-                    $name_stmt->close();
-                    $item_name = $row['item_name'] ?? null;
-
-                    if ($item_name) {
-                        $check = $conn->prepare("SELECT id FROM stock_inventory WHERE restaurant_id = ? AND stock_name = ?");
-                        $check->bind_param("is", $restaurant_id, $item_name);
-                        $check->execute();
-                        $exists = $check->get_result()->num_rows > 0;
-                        $check->close();
-
-                        if ($exists) {
+                    // Restore Stock
+                    foreach ($cur_items as $item) {
+                        $it_stmt = $conn->prepare("SELECT item_name FROM menu_items WHERE id = ?");
+                        $it_stmt->bind_param("i", $item['item_id']);
+                        $it_stmt->execute();
+                        $it_row = $it_stmt->get_result()->fetch_assoc();
+                        if ($it_row) {
                             $restore = $conn->prepare("UPDATE stock_inventory SET quantity = quantity + ? WHERE restaurant_id = ? AND stock_name = ?");
-                            $restore->bind_param("iis", $qty, $restaurant_id, $item_name);
+                            $restore->bind_param("iis", $item['quantity'], $restaurant_id, $it_row['item_name']);
                             $restore->execute();
-                            $restore->close();
                         }
                     }
+
+                    $del = $conn->prepare("DELETE FROM orders WHERE id = ? AND restaurant_id = ?");
+                    $del->bind_param("ii", $order_id, $restaurant_id);
+                    $del->execute();
+
+                    $conn->commit();
+                    $success_msg = "Order deleted successfully.";
+                } catch (Exception $e) {
+                    $conn->rollback();
+                    $error_msg = "Delete failed.";
                 }
-
-                $del = $conn->prepare("DELETE FROM orders WHERE id = ? AND restaurant_id = ?");
-                $del->bind_param("ii", $order_id, $restaurant_id);
-                $del->execute();
-                $del->close();
-
-                $conn->commit();
-                $success_msg = "Order deleted successfully!";
-            } catch (Exception $e) {
-                $conn->rollback();
-                $error_msg = "Delete failed.";
             }
-        } else {
-            // === UPDATE ORDER ===
+        } 
+        // --- UPDATE ORDER LOGIC ---
+        else {
             $selected_items = $_POST['selected_items'] ?? [];
             $quantities = $_POST['quantities'] ?? [];
             $notes_arr = $_POST['notes'] ?? [];
-            $table_identifier = trim($_POST['table_identifier'] ?? '');
+            $table_id = trim($_POST['table_identifier'] ?? $order['table_number']);
 
-            if (empty($selected_items)) {
-                $error_msg = "Please select at least one item.";
-            } elseif (empty($table_identifier)) {
-                $error_msg = "Please enter Table / Name / Phone.";
-            } else {
-                $placeholders = str_repeat('?,', count($selected_items) - 1) . '?';
-                $stmt = $conn->prepare("SELECT id, item_name, price FROM menu_items WHERE id IN ($placeholders) AND restaurant_id = ? AND status = 'available'");
-                $params = array_merge($selected_items, [$restaurant_id]);
-                $types = str_repeat('i', count($selected_items)) . 'i';
-                $refs = [];
-                foreach ($params as $k => $v) $refs[] = &$params[$k];
-                call_user_func_array([$stmt, 'bind_param'], array_merge([$types], $refs));
-                $stmt->execute();
-                $result = $stmt->get_result();
+            try {
+                $conn->begin_transaction();
+                $total = 0; $items_data = [];
 
-                $prices = [];
-                while ($row = $result->fetch_assoc()) {
-                    $prices[$row['id']] = ['name' => $row['item_name'], 'price' => $row['price']];
-                }
-                $stmt->close();
-
-                try {
-                    $conn->begin_transaction();
-                    $total = 0;
-                    $items_data = [];
-
-                    foreach ($selected_items as $item_id_str) {
-                        $item_id = (int)$item_id_str;
-                        if (!isset($prices[$item_id])) continue;
-
-                        $qty = max(1, (int)($quantities[$item_id_str] ?? 1));
-                        $note = trim($notes_arr[$item_id_str] ?? '');
-                        $price = $prices[$item_id]['price'];
-                        $old_qty = $current_qty[$item_id] ?? 0;
-                        $diff = $qty - $old_qty;
-
-                        $total += $qty * $price;
+                foreach ($selected_items as $item_id) {
+                    $item_id = (int)$item_id;
+                    $stmt = $conn->prepare("SELECT item_name, price FROM menu_items WHERE id = ?");
+                    $stmt->bind_param("i", $item_id);
+                    $stmt->execute();
+                    $mi = $stmt->get_result()->fetch_assoc();
+                    
+                    if ($mi) {
+                        $qty = max(1, (int)($quantities[$item_id] ?? 1));
+                        $note = trim($notes_arr[$item_id] ?? '');
+                        $total += $qty * $mi['price'];
                         $items_data[] = ['item_id' => $item_id, 'quantity' => $qty, 'notes' => $note];
 
+                        // Stock management
+                        $old_q = $current_qty[$item_id] ?? 0;
+                        $diff = $qty - $old_q;
                         if ($diff != 0) {
-                            $item_name = $prices[$item_id]['name'];
-                            $check = $conn->prepare("SELECT quantity FROM stock_inventory WHERE restaurant_id = ? AND stock_name = ?");
-                            $check->bind_param("is", $restaurant_id, $item_name);
-                            $check->execute();
-                            $stock_row = $check->get_result()->fetch_assoc();
-                            $check->close();
-
-                            if ($stock_row) {
-                                if ($diff > 0 && $stock_row['quantity'] < $diff) {
-                                    throw new Exception("Not enough stock for <strong>$item_name</strong>.");
-                                }
-                                $op = $diff > 0 ? '-' : '+';
-                                $abs_diff = abs($diff);
-                                $update = $conn->prepare("UPDATE stock_inventory SET quantity = quantity $op ? WHERE restaurant_id = ? AND stock_name = ?");
-                                $update->bind_param("iis", $abs_diff, $restaurant_id, $item_name);
-                                $update->execute();
-                                $update->close();
-                            }
+                            $op = $diff > 0 ? '-' : '+';
+                            $abs_diff = abs($diff);
+                            $upd_stock = $conn->prepare("UPDATE stock_inventory SET quantity = quantity $op ? WHERE restaurant_id = ? AND stock_name = ?");
+                            $upd_stock->bind_param("iis", $abs_diff, $restaurant_id, $mi['item_name']);
+                            $upd_stock->execute();
                         }
                     }
-
-                    $old_data = [
-                        'items' => $cur_items,
-                        'total_amount' => $order['total_amount'],
-                        'table_number' => $order['table_number']
-                    ];
-                    $remarks = "Order edited by superadmin";
-                    $change_time = nepali_date_time();
-
-                    $archive = $conn->prepare("INSERT INTO old_order (order_id, restaurant_id, changed_by, change_time, old_data, remarks) VALUES (?, ?, ?, ?, ?, ?)");
-                    $json_old = json_encode($old_data);
-                    $archive->bind_param("iiisss", $order_id, $restaurant_id, $user_id, $change_time, $json_old, $remarks);
-                    $archive->execute();
-                    $archive->close();
-
-                    $items_json = json_encode($items_data);
-                    $updated_at_bs = nepali_date_time();
-
-                    $upd = $conn->prepare("UPDATE orders SET table_number = ?, items = ?, total_amount = ?, updated_at = ? WHERE id = ? AND restaurant_id = ?");
-                    $upd->bind_param("ssdssi", $table_identifier, $items_json, $total, $updated_at_bs, $order_id, $restaurant_id);
-                    $upd->execute();
-                    $upd->close();
-
-                    $conn->commit();
-                    $success_msg = "Order updated successfully!";
-                } catch (Exception $e) {
-                    $conn->rollback();
-                    $error_msg = $e->getMessage();
                 }
-            }
+
+                $items_json = json_encode($items_data);
+                $upd_at = nepali_date_time();
+                $upd = $conn->prepare("UPDATE orders SET table_number = ?, items = ?, total_amount = ?, updated_at = ? WHERE id = ?");
+                $upd->bind_param("ssdsi", $table_id, $items_json, $total, $upd_at, $order_id);
+                $upd->execute();
+
+                $conn->commit();
+                $success_msg = "Order updated successfully.";
+            } catch (Exception $e) { $conn->rollback(); $error_msg = "Update failed."; }
         }
     }
 }
 
 /* ==================== FETCH DATA ==================== */
-$stmt = $conn->prepare("SELECT o.*, u.username AS ordered_by_name 
-                        FROM orders o 
-                        LEFT JOIN users u ON o.order_by = u.id 
-                        WHERE o.restaurant_id = ? 
-                          AND o.status = 'preparing' 
-                        ORDER BY o.id DESC");
+$stmt = $conn->prepare("SELECT o.*, u.username FROM orders o LEFT JOIN users u ON o.order_by = u.id WHERE o.restaurant_id = ? AND o.status = 'preparing' ORDER BY o.id DESC");
 $stmt->bind_param("i", $restaurant_id);
 $stmt->execute();
-$orders_result = $stmt->get_result();
-$orders = $orders_result->fetch_all(MYSQLI_ASSOC);
-$stmt->close();
+$orders = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
 
-$stmt = $conn->prepare("SELECT id, item_name, price, description, category FROM menu_items WHERE restaurant_id = ? AND status = 'available'");
+$stmt = $conn->prepare("SELECT id, item_name, price, category FROM menu_items WHERE restaurant_id = ? AND status = 'available'");
 $stmt->bind_param("i", $restaurant_id);
 $stmt->execute();
-$menu_result = $stmt->get_result();
-$menu_items = $menu_result->fetch_all(MYSQLI_ASSOC);
-$stmt->close();
+$menu_items = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
 
 $categories = array_unique(array_filter(array_column($menu_items, 'category')));
 sort($categories);
 
 $stock = [];
-$stock_stmt = $conn->prepare("SELECT stock_name, quantity FROM stock_inventory WHERE restaurant_id = ?");
-$stock_stmt->bind_param("i", $restaurant_id);
-$stock_stmt->execute();
-$res = $stock_stmt->get_result();
-while ($row = $res->fetch_assoc()) {
-    $stock[$row['stock_name']] = $row['quantity'];
-}
-$stock_stmt->close();
+$res = $conn->query("SELECT stock_name, quantity FROM stock_inventory WHERE restaurant_id = $restaurant_id");
+while($r = $res->fetch_assoc()) $stock[$r['stock_name']] = $r['quantity'];
 ?>
 
 <!doctype html>
@@ -242,420 +156,226 @@ $stock_stmt->close();
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Edit Orders - <?= htmlspecialchars($restaurant_name) ?></title>
+    <title>Edit Orders - <?= $restaurant_name ?></title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
     <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" rel="stylesheet">
-    <link href="../admin.css" rel="stylesheet">
     <style>
-        .item-card:hover { transform: translateY(-5px); box-shadow: 0 8px 20px rgba(0,0,0,0.15); transition: all 0.3s ease; }
-        .item-details { display: none; margin-top: 12px; }
-        .stock-available { color: #17a2b8; font-weight: 500; }
-        #centerToast {
-            position: fixed;
-            top: 50%;
-            left: 50%;
-            transform: translate(-50%, -50%);
-            z-index: 1050;
-            min-width: 300px;
-            box-shadow: 0 4px 20px rgba(0,0,0,0.2);
-            display: none;
-        }
-        .order-card-wrapper { margin-bottom: 3rem; }
-        .order-info-row { background-color: #f8f9fa; padding: 1rem; border-radius: 8px; margin-bottom: 1rem; }
+        .item-card { transition: 0.2s; border: 1px solid #eee; }
+        .item-card:hover { border-color: #198754; box-shadow: 0 4px 10px rgba(0,0,0,0.1); }
+        .order-card-wrapper { display: none; }
+        .table-selector-card { cursor: pointer; transition: 0.3s; }
+        .table-selector-card:hover { background: #198754; color: white; }
     </style>
 </head>
 <body class="bg-light">
 
 <?php include 'navbar.php'; ?>
-
-<div class="container py-4 py-md-5">
-    <h3 class="mb-4 text-center text-success fw-bold">Edit Orders - <?= htmlspecialchars($restaurant_name) ?></h3>
-
-    <div class="text-center mb-4">
-        <a href="view_branch.php" class="btn btn-secondary px-5">Back</a>
+<div class="container py-4">
+    <div class="d-flex justify-content-between align-items-center mb-4">
+        <h3 class="fw-bold text-success m-0">Edit Orders</h3>
+        <a href="view_branch.php" class="btn btn-secondary shadow-sm">
+            <i class="bi bi-arrow-left me-1"></i> Back to Branch
+        </a>
     </div>
 
-    <?php if ($success_msg): ?>
-    <div class="alert alert-success text-center p-4 rounded shadow-sm mb-4">
-        <strong><?= htmlspecialchars($success_msg) ?></strong>
-    </div>
+    <?php if($success_msg): ?><div class="alert alert-success"><?= $success_msg ?></div><?php endif; ?>
+    <?php if($error_msg): ?><div class="alert alert-danger"><?= $error_msg ?></div><?php endif; ?>
+
+    <div id="tableSelectionGrid" class="row g-3 justify-content-center mb-5">
+    <?php if (empty($orders)): ?>
+        <div class="col-12 text-center py-5">
+            <div class="mb-4">
+                <i class="bi bi-clipboard-x text-muted" style="font-size: 4rem;"></i>
+            </div>
+            <h4 class="text-muted">No orders are currently being prepared.</h4>
+            <p class="mb-4">All orders are either completed or haven't been placed yet.</p>
+            <a href="view_branch.php" class="btn btn-primary px-5 py-2 fw-bold shadow-sm">
+                Go Back to View Branch
+            </a>
+        </div>
+    <?php else: ?>
+        <h5 class="text-center mb-4 text-muted col-12">Select a Table to Edit:</h5>
+        <?php foreach ($orders as $order): ?>
+        <div class="col-6 col-md-3">
+            <div class="card table-selector-card shadow-sm text-center py-4 border-0" onclick="showOrderForm(<?= $order['id'] ?>)">
+                <span class="text-muted small text-uppercase fw-bold">Table Name</span>
+                <h3 class="mb-0 text-success fw-bold"><?= htmlspecialchars($order['table_number']) ?></h3>
+            </div>
+        </div>
+        <?php endforeach; ?>
     <?php endif; ?>
-
-    <?php if ($error_msg): ?>
-    <div class="alert alert-danger text-center p-4 rounded shadow-sm mb-4">
-        <?= nl2br(htmlspecialchars($error_msg)) ?>
     </div>
-    <?php endif; ?>
-
-    <!-- One order per block -->
+</div>
     <?php foreach ($orders as $order): ?>
-    <div class="row order-card-wrapper">
-        <div class="col-12">
-            <div class="card shadow-sm">
-                <div class="card-header bg-primary text-white">
-                    <h6 class="mb-0">Order #<?= $order['id'] ?> - <?= htmlspecialchars($order['table_number']) ?></h6>
-                    <small>By: <?= htmlspecialchars($order['ordered_by_name'] ?? 'Unknown') ?> | <?= $order['created_at'] ?></small>
-                </div>
-                <div class="card-body">
-                    <!-- Row 1: Total -->
-                    <div class="row order-info-row">
-                        <div class="col-12">
-                            <strong>Total Amount:</strong> Rs <?= number_format($order['total_amount'], 2) ?>
-                        </div>
+    <div class="order-card-wrapper" id="orderBlock_<?= $order['id'] ?>">
+        <div class="card shadow-sm border-0">
+            <div class="card-header bg-white d-flex justify-content-between align-items-center">
+                <h5 class="mb-0">Table: <?= htmlspecialchars($order['table_number']) ?></h5>
+                <button class="btn btn-outline-secondary btn-sm" onclick="location.reload()">Back to List</button>
+            </div>
+            <div class="card-body">
+                <form method="POST" id="editForm_<?= $order['id'] ?>">
+                    <input type="hidden" name="order_id" value="<?= $order['id'] ?>">
+                    
+                    <div class="mb-4">
+                        <label class="form-label fw-bold">Search Menu Items</label>
+                        <input type="text" class="form-control form-control-lg shadow-sm" placeholder="Search across all categories..." id="searchInput_<?= $order['id'] ?>" oninput="handleGlobalSearch(<?= $order['id'] ?>)">
                     </div>
 
-                    <!-- Row 2: Status -->
-                    <div class="row order-info-row">
-                        <div class="col-12">
-                            <strong>Status:</strong> <span class="badge bg-warning"><?= ucfirst($order['status']) ?></span>
-                        </div>
+                    <ul class="nav nav-pills mb-3" id="catTabs_<?= $order['id'] ?>">
+                        <?php foreach ($categories as $idx => $cat): ?>
+                        <li class="nav-item">
+                            <button class="nav-link <?= $idx===0?'active':'' ?>" type="button" onclick="switchCategory(<?= $order['id'] ?>, '<?= htmlspecialchars($cat) ?>', this)"><?= $cat ?></button>
+                        </li>
+                        <?php endforeach; ?>
+                    </ul>
+
+                    <div class="row g-3" id="menuGrid_<?= $order['id'] ?>"></div>
+
+                    <div class="mt-5 border-top pt-4 text-center">
+                        <button type="button" class="btn btn-success px-5 py-2 fw-bold" onclick="prepareUpdate(<?= $order['id'] ?>)">Update Order</button>
+                        <button type="button" class="btn btn-danger px-5 py-2 fw-bold ms-2" onclick="showDeleteModal(<?= $order['id'] ?>)">Delete Order</button>
                     </div>
-
-                    <!-- Row 3: Edit Items -->
-                    <div class="row">
-                        <div class="col-12">
-                            <form method="POST" id="editForm_<?= $order['id'] ?>">
-                                <input type="hidden" name="order_id" value="<?= $order['id'] ?>">
-                                <input type="hidden" name="table_identifier" value="<?= htmlspecialchars($order['table_number']) ?>">
-
-                                <div class="mb-3">
-                                    <label class="form-label fw-bold">Edit Items</label>
-                                    <div class="input-group">
-                                        <input type="text" class="form-control" placeholder="Search items..." id="searchInput_<?= $order['id'] ?>">
-                                    </div>
-                                </div>
-
-                                <?php 
-                                $order_items = json_decode($order['items'], true) ?? [];
-                                $order_categories = array_unique(array_merge(array_column($order_items, 'category'), $categories));
-                                sort($order_categories);
-                                ?>
-                                <ul class="nav nav-tabs mb-3" id="catTabs_<?= $order['id'] ?>">
-                                    <?php foreach ($order_categories as $idx => $cat): ?>
-                                    <li class="nav-item">
-                                        <button class="nav-link <?= $idx === 0 ? 'active' : '' ?>" type="button" data-order="<?= $order['id'] ?>" data-cat="<?= htmlspecialchars($cat ?: 'Uncategorized') ?>">
-                                            <?= htmlspecialchars($cat ?: 'Uncategorized') ?>
-                                        </button>
-                                    </li>
-                                    <?php endforeach; ?>
-                                </ul>
-
-                                <div class="row g-3" id="menuGrid_<?= $order['id'] ?>"></div>
-
-                                <div class="text-center mt-4">
-                                    <button type="button" class="btn btn-primary me-2" id="updateBtn_<?= $order['id'] ?>" data-order="<?= $order['id'] ?>">
-                                        Update Order
-                                    </button>
-                                    <button type="button" class="btn btn-danger" onclick="showDeleteModal(<?= $order['id'] ?>)">
-                                        Delete Order
-                                    </button>
-                                </div>
-                            </form>
-                        </div>
-                    </div>
-                </div>
+                </form>
             </div>
         </div>
     </div>
     <?php endforeach; ?>
 </div>
 
-<!-- Centered Toast -->
-<div id="centerToast" class="card border-0">
-    <div class="card-body text-center">
-        <i class="bi bi-exclamation-triangle fs-1 text-danger mb-3"></i>
-        <p id="toastMessage" class="fw-bold fs-5"></p>
-    </div>
-</div>
+<div class="modal fade" id="confirmModal" tabindex="-1"><div class="modal-dialog modal-dialog-centered"><div class="modal-content"><div class="modal-header bg-success text-white"><h5>Confirm Changes</h5><button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button></div><div class="modal-body" id="orderSummary"></div><div class="modal-footer"><button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button><button type="button" class="btn btn-success" id="finalUpdateBtn">Confirm & Update</button></div></div></div></div>
 
-<!-- Confirm Update Modal -->
-<div class="modal fade" id="confirmModal" tabindex="-1">
-    <div class="modal-dialog modal-dialog-centered">
-        <div class="modal-content">
-            <div class="modal-header bg-success text-white">
-                <h5 class="modal-title">Confirm Update</h5>
-                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
-            </div>
-            <div class="modal-body">
-                <div id="orderSummary"></div>
-            </div>
-            <div class="modal-footer">
-                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
-                <button type="button" class="btn btn-success" id="confirmUpdateBtn">Confirm Update</button>
-            </div>
-        </div>
-    </div>
-</div>
-
-<!-- Delete Confirmation Modal -->
-<div class="modal fade" id="deleteModal" tabindex="-1">
-    <div class="modal-dialog modal-dialog-centered">
-        <div class="modal-content">
-            <div class="modal-header bg-danger text-white">
-                <h5 class="modal-title">Delete Order</h5>
-                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
-            </div>
-            <div class="modal-body text-center">
-                <p>Are you sure you want to delete this order?</p>
-                <p class="text-danger fw-bold">This action cannot be undone.</p>
-            </div>
-            <div class="modal-footer">
-                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
-                <button type="button" class="btn btn-danger" id="confirmDeleteBtn">Yes, Delete</button>
-            </div>
-        </div>
-    </div>
-</div>
+<div class="modal fade" id="deleteModal" tabindex="-1"><div class="modal-dialog modal-dialog-centered"><div class="modal-content"><div class="modal-header bg-danger text-white"><h5>Delete Order</h5></div><div class="modal-body">
+    <p>Are you sure you want to delete this order? This cannot be undone.</p>
+    <label class="form-label fw-bold mt-2">Reason for Deletion (Required):</label>
+    <textarea id="deleteReason" class="form-control" rows="3" placeholder="e.g., Customer left, Wrong entry..."></textarea>
+</div><div class="modal-footer"><button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button><button type="button" class="btn btn-danger" onclick="submitDelete()">Delete Permanently</button></div></div></div></div>
 
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
 <script>
     const menuItems = <?= json_encode($menu_items) ?>;
     const stock = <?= json_encode($stock) ?>;
-
     let orderState = {};
     let currentOrderId = null;
+    let currentCategory = "";
 
-    const confirmModal = new bootstrap.Modal('#confirmModal');
-    const deleteModal = new bootstrap.Modal('#deleteModal');
-
-    function escapeHtml(text) {
-        const div = document.createElement('div');
-        div.textContent = text || '';
-        return div.innerHTML;
+    function showOrderForm(id) {
+        document.getElementById('tableSelectionGrid').style.display = 'none';
+        document.getElementById('orderBlock_' + id).style.display = 'block';
+        currentOrderId = id;
+        const firstCat = document.querySelector(`#catTabs_${id} .nav-link.active`).innerText;
+        switchCategory(id, firstCat, document.querySelector(`#catTabs_${id} .nav-link.active`));
     }
 
-    function showCenterToast(message) {
-        document.getElementById('toastMessage').textContent = message;
-        document.getElementById('centerToast').style.display = 'block';
-        setTimeout(() => document.getElementById('centerToast').style.display = 'none', 4000);
+    function switchCategory(orderId, cat, btn) {
+        document.querySelectorAll(`#catTabs_${orderId} .nav-link`).forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        currentCategory = cat;
+        renderItems(orderId, item => item.category === cat);
     }
 
-    function renderCategory(orderId, cat) {
+    function handleGlobalSearch(orderId) {
+        const query = document.getElementById('searchInput_' + orderId).value.toLowerCase();
+        const tabContainer = document.getElementById('catTabs_' + orderId);
+        
+        if (query.length > 0) {
+            tabContainer.style.display = 'none'; // Hide tabs to focus on search results
+            renderItems(orderId, item => item.item_name.toLowerCase().includes(query));
+        } else {
+            tabContainer.style.display = 'flex'; // Show tabs back
+            renderItems(orderId, item => item.category === currentCategory);
+        }
+    }
+
+    function renderItems(orderId, filterFn) {
         const grid = document.getElementById('menuGrid_' + orderId);
         grid.innerHTML = '';
-
-        const filtered = menuItems.filter(item => (item.category || '').trim() === cat);
-        if (filtered.length === 0) {
-            grid.innerHTML = '<div class="col-12 text-center py-5 text-muted">No items in this category</div>';
-            return;
-        }
+        const filtered = menuItems.filter(filterFn);
 
         filtered.forEach(item => {
-            const state = (orderState[orderId] && orderState[orderId][item.id]) || { qty: 1, notes: '' };
-            const checked = !!orderState[orderId]?.[item.id];
-            const hasStock = stock.hasOwnProperty(item.item_name);
-            const stockDisplay = hasStock ? stock[item.item_name] : null;
+            const state = orderState[orderId][item.id] || null;
+            const checked = state !== null;
+            const itemStock = stock[item.item_name] ?? 'N/A';
 
-            const div = document.createElement('div');
-            div.className = 'col-6 col-md-4 col-lg-3 mb-4';
-            div.innerHTML = `
-                <div class="card h-100 border-0 shadow-sm item-card">
-                    <div class="card-body p-3">
+            const col = document.createElement('div');
+            col.className = 'col-6 col-md-4 col-lg-3';
+            col.innerHTML = `
+                <div class="card h-100 item-card">
+                    <div class="card-body p-2">
                         <div class="form-check">
-                            <input class="form-check-input" type="checkbox" value="${item.id}" id="item_${orderId}_${item.id}" ${checked ? 'checked' : ''}>
-                            <label class="form-check-label fw-bold small d-block" for="item_${orderId}_${item.id}">
-                                ${escapeHtml(item.item_name)}
-                                <span class="badge bg-info ms-1 small">${escapeHtml(item.category)}</span>
-                                <span class="text-success float-end small">Rs ${parseFloat(item.price).toFixed(2)}</span>
-                            </label>
-                            ${item.description ? `<small class="d-block text-muted mt-1 small">${escapeHtml(item.description)}</small>` : ''}
-                            <div class="mt-2 small">
-                                <span class="badge bg-success">Available</span>
-                                ${hasStock ? `<span class="ms-2 stock-available">Stock: ${stockDisplay}</span>` : ''}
-                            </div>
+                            <input class="form-check-input" type="checkbox" id="chk_${orderId}_${item.id}" ${checked?'checked':''} onchange="toggleItem(${orderId}, ${item.id})">
+                            <label class="form-check-label fw-bold d-block" for="chk_${orderId}_${item.id}">${item.item_name}</label>
                         </div>
-                        <div id="details_${orderId}_${item.id}" style="display:${checked ? 'block' : 'none'}; margin-top:12px;">
-                            <div class="input-group input-group-sm mb-2">
-                                <span class="input-group-text">Qty</span>
-                                <input type="number" class="form-control qty-input" value="${state.qty}" min="1">
-                            </div>
-                            <div class="input-group input-group-sm">
-                                <span class="input-group-text">Notes</span>
-                                <input type="text" class="form-control notes-input"
-                                       value="${escapeHtml(state.notes)}" placeholder="e.g. less spicy">
-                            </div>
+                        <small class="text-success d-block mb-2">Rs ${item.price} | Stock: ${itemStock}</small>
+                        <div id="input_${orderId}_${item.id}" style="display:${checked?'block':'none'}">
+                            <input type="number" class="form-control form-control-sm mb-1" value="${state?.qty || 1}" oninput="updateState(${orderId}, ${item.id}, 'qty', this.value)" placeholder="Qty">
+                            <input type="text" class="form-control form-control-sm" value="${state?.notes || ''}" oninput="updateState(${orderId}, ${item.id}, 'notes', this.value)" placeholder="Notes">
                         </div>
                     </div>
-                </div>
-            `;
-            grid.appendChild(div);
+                </div>`;
+            grid.appendChild(col);
         });
     }
 
-    // Initialize orderState with existing items
-    <?php foreach ($orders as $order): ?>
-    orderState[<?= $order['id'] ?>] = {};
-    <?php 
-    $order_items = json_decode($order['items'], true) ?? [];
-    foreach ($order_items as $i): 
-    ?>
-    orderState[<?= $order['id'] ?>][<?= $i['item_id'] ?>] = { qty: <?= $i['quantity'] ?>, notes: <?= json_encode($i['notes'] ?? '') ?> };
-    <?php endforeach; ?>
-    <?php endforeach; ?>
+    // Initialize state with existing items
+    <?php foreach($orders as $o): ?>
+    orderState[<?= $o['id'] ?>] = {};
+    <?php $items = json_decode($o['items'], true) ?? []; foreach($items as $i): ?>
+    orderState[<?= $o['id'] ?>][<?= $i['item_id'] ?>] = { qty: <?= $i['quantity'] ?>, notes: <?= json_encode($i['notes'] ?? '') ?> };
+    <?php endforeach; endforeach; ?>
 
-    // Tab switching
-    document.querySelectorAll('[id^="catTabs_"] button').forEach(btn => {
-        btn.addEventListener('click', function() {
-            const orderId = this.dataset.order;
-            const cat = this.dataset.cat;
-            document.querySelectorAll(`#catTabs_${orderId} button`).forEach(b => b.classList.remove('active'));
-            this.classList.add('active');
-            renderCategory(orderId, cat);
-        });
-    });
-
-    // Checkbox & input listeners
-    document.addEventListener('change', function(e) {
-        if (e.target.type === 'checkbox' && e.target.id.startsWith('item_')) {
-            const match = e.target.id.match(/item_(\d+)_(\d+)/);
-            if (!match) return;
-            const orderId = match[1];
-            const itemId = match[2];
-            const details = document.getElementById('details_' + orderId + '_' + itemId);
-
-            if (!orderState[orderId]) orderState[orderId] = {};
-
-            if (e.target.checked) {
-                details.style.display = 'block';
-                const qtyInput = details.querySelector('.qty-input');
-                const notesInput = details.querySelector('.notes-input');
-                orderState[orderId][itemId] = {
-                    qty: parseInt(qtyInput.value) || 1,
-                    notes: notesInput.value.trim()
-                };
-            } else {
-                details.style.display = 'none';
-                delete orderState[orderId][itemId];
-            }
+    function toggleItem(orderId, itemId) {
+        const isChecked = document.getElementById(`chk_${orderId}_${itemId}`).checked;
+        const inputDiv = document.getElementById(`input_${orderId}_${itemId}`);
+        if(isChecked) {
+            orderState[orderId][itemId] = { qty: 1, notes: "" };
+            inputDiv.style.display = 'block';
+        } else {
+            delete orderState[orderId][itemId];
+            inputDiv.style.display = 'none';
         }
-    });
-
-    document.addEventListener('input', function(e) {
-        if (e.target.classList.contains('qty-input') || e.target.classList.contains('notes-input')) {
-            const card = e.target.closest('.item-card');
-            if (!card) return;
-            const checkbox = card.querySelector('input[type="checkbox"]');
-            if (!checkbox || !checkbox.checked) return;
-
-            const match = checkbox.id.match(/item_(\d+)_(\d+)/);
-            if (!match) return;
-            const orderId = match[1];
-            const itemId = match[2];
-
-            if (!orderState[orderId]) orderState[orderId] = {};
-
-            const qty = parseInt(card.querySelector('.qty-input').value) || 1;
-            const notes = card.querySelector('.notes-input').value.trim();
-            orderState[orderId][itemId] = { qty, notes };
-        }
-    });
-
-    // Update button - show confirmation modal
-    document.querySelectorAll('[id^="updateBtn_"]').forEach(btn => {
-        btn.addEventListener('click', function() {
-            currentOrderId = this.dataset.order;
-            const form = document.getElementById('editForm_' + currentOrderId);
-            const table = form.querySelector('input[name="table_identifier"]').value.trim();
-            const selected = Object.keys(orderState[currentOrderId] || {});
-
-            if (selected.length === 0) {
-                showCenterToast('Please select at least one item to update the order.');
-                return;
-            }
-            if (!table) {
-                showCenterToast('Please enter Table / Name / Phone.');
-                return;
-            }
-
-            let html = `<p class="fw-bold fs-5 mb-3">Update order for: <span class="text-primary">${escapeHtml(table)}</span></p>`;
-            html += '<ul class="list-group list-group-flush">';
-            let total = 0;
-
-            selected.forEach(id => {
-                const item = menuItems.find(i => i.id == id);
-                if (!item) return;
-                const { qty, notes } = orderState[currentOrderId][id];
-                const sub = item.price * qty;
-                total += sub;
-                html += `
-                    <li class="list-group-item d-flex justify-content-between">
-                        <div>
-                            <div class="fw-bold">${escapeHtml(item.item_name)} × ${qty}</div>
-                            ${notes ? `<small class="text-muted">${escapeHtml(notes)}</small>` : ''}
-                        </div>
-                        <span class="badge bg-primary rounded-pill">Rs ${sub.toFixed(2)}</span>
-                    </li>`;
-            });
-
-            html += `</ul><hr><div class="d-flex justify-content-between fs-5">
-                <strong>Total Amount:</strong>
-                <strong class="text-success">Rs ${total.toFixed(2)}</strong>
-            </div>`;
-
-            document.getElementById('orderSummary').innerHTML = html;
-            confirmModal.show();
-        });
-    });
-
-    // Confirm update - create hidden fields from array and submit
-    document.getElementById('confirmUpdateBtn').addEventListener('click', () => {
-        const form = document.getElementById('editForm_' + currentOrderId);
-
-        // Remove any old hidden fields
-        form.querySelectorAll('input[type="hidden"][name^="selected_items"], input[type="hidden"][name^="quantities["], input[type="hidden"][name^="notes["]').forEach(el => el.remove());
-
-        // Create hidden fields from orderState array (all items, all categories)
-        Object.keys(orderState[currentOrderId] || {}).forEach(itemId => {
-            const { qty, notes } = orderState[currentOrderId][itemId];
-
-            const hiddenId = document.createElement('input');
-            hiddenId.type = 'hidden';
-            hiddenId.name = 'selected_items[]';
-            hiddenId.value = itemId;
-            form.appendChild(hiddenId);
-
-            const hiddenQty = document.createElement('input');
-            hiddenQty.type = 'hidden';
-            hiddenQty.name = `quantities[${itemId}]`;
-            hiddenQty.value = qty;
-            form.appendChild(hiddenQty);
-
-            const hiddenNotes = document.createElement('input');
-            hiddenNotes.type = 'hidden';
-            hiddenNotes.name = `notes[${itemId}]`;
-            hiddenNotes.value = notes;
-            form.appendChild(hiddenNotes);
-        });
-
-        form.submit();
-    });
-
-    function showDeleteModal(id) {
-        currentOrderId = id;
-        deleteModal.show();
     }
 
-    document.getElementById('confirmDeleteBtn').addEventListener('click', () => {
+    function updateState(orderId, itemId, key, val) {
+        if(orderState[orderId][itemId]) orderState[orderId][itemId][key] = val;
+    }
+
+    function prepareUpdate(orderId) {
+        const selected = Object.keys(orderState[orderId]);
+        if(selected.length === 0) return alert("Select at least one item.");
+        
+        let html = '<ul class="list-group">';
+        selected.forEach(sid => {
+            const menu = menuItems.find(m => m.id == sid);
+            html += `<li class="list-group-item d-flex justify-content-between"><span>${menu.item_name} x ${orderState[orderId][sid].qty}</span></li>`;
+        });
+        document.getElementById('orderSummary').innerHTML = html + '</ul>';
+        new bootstrap.Modal('#confirmModal').show();
+    }
+
+    document.getElementById('finalUpdateBtn').addEventListener('click', () => {
         const form = document.getElementById('editForm_' + currentOrderId);
-        const input = document.createElement('input');
-        input.type = 'hidden';
-        input.name = 'delete_order';
-        input.value = '1';
-        form.appendChild(input);
+        Object.keys(orderState[currentOrderId]).forEach(id => {
+            const s = orderState[currentOrderId][id];
+            form.insertAdjacentHTML('beforeend', `<input type="hidden" name="selected_items[]" value="${id}">`);
+            form.insertAdjacentHTML('beforeend', `<input type="hidden" name="quantities[${id}]" value="${s.qty}">`);
+            form.insertAdjacentHTML('beforeend', `<input type="hidden" name="notes[${id}]" value="${s.notes}">`);
+        });
         form.submit();
     });
 
-    // Initial load
-    document.addEventListener('DOMContentLoaded', () => {
-        document.querySelectorAll('[id^="catTabs_"] button:first-child').forEach(first => {
-            first.classList.add('active');
-            const orderId = first.dataset.order;
-            const cat = first.dataset.cat;
-            renderCategory(orderId, cat);
-        });
-    });
+    function showDeleteModal(id) { currentOrderId = id; new bootstrap.Modal('#deleteModal').show(); }
+    
+    function submitDelete() {
+        const reason = document.getElementById('deleteReason').value.trim();
+        if(!reason) return alert("You must provide a reason for deletion.");
+        
+        const form = document.getElementById('editForm_' + currentOrderId);
+        form.insertAdjacentHTML('beforeend', `<input type="hidden" name="delete_order" value="1">`);
+        form.insertAdjacentHTML('beforeend', `<input type="hidden" name="delete_reason" value="${reason}">`);
+        form.submit();
+    }
 </script>
 
-<?php include '../Common/footer.php'; ?>
 </body>
 </html>
