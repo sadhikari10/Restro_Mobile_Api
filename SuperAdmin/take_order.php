@@ -175,6 +175,14 @@ while ($row = $res->fetch_assoc()) {
 $stock_stmt->close();
 
 $table_identifier_val = $_POST['table_identifier'] ?? '';
+
+// Fetch Predefined Tables for the dropdown
+$tables_stmt = $conn->prepare("SELECT table_name FROM restaurant_tables WHERE restaurant_id = ? ORDER BY table_name ASC");
+$tables_stmt->bind_param("i", $restaurant_id);
+$tables_stmt->execute();
+$predefined_tables = $tables_stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+$tables_stmt->close();
+
 ?>
 
 <!doctype html>
@@ -239,9 +247,15 @@ $table_identifier_val = $_POST['table_identifier'] ?? '';
                 <input type="hidden" name="token" value="<?= $token ?>">
 
                 <div class="mb-4">
-                    <label class="form-label fw-bold">Table Number / Customer Name / Phone <span class="text-danger">*</span></label>
-                    <input type="text" name="table_identifier" id="table_identifier" class="form-control form-control-lg"
-                           placeholder="e.g. Table 7, Ramesh, 98xxxxxxxx" value="<?= htmlspecialchars($table_identifier_val) ?>" required>
+                    <label class="form-label fw-bold">Select Table Number / Customer <span class="text-danger">*</span></label>
+                    <select name="table_identifier" id="table_identifier" class="form-select form-select-lg" required>
+                        <option value="" disabled <?= empty($table_identifier_val) ? 'selected' : '' ?>>-- Choose Table --</option>
+                        <?php foreach ($predefined_tables as $t): ?>
+                            <option value="<?= htmlspecialchars($t['table_name']) ?>" <?= ($table_identifier_val == $t['table_name']) ? 'selected' : '' ?>>
+                                <?= htmlspecialchars($t['table_name']) ?>
+                            </option>
+                        <?php endforeach; ?>
+                    </select>
                 </div>
 
                 <div class="mb-4">
