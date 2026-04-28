@@ -511,22 +511,73 @@ grid.addEventListener('input', function(e) {
     }
 });
 
-document.querySelectorAll('#categoryTabs button').forEach(tab => {
-    tab.addEventListener('click', function () {
-        document.querySelectorAll('#categoryTabs button').forEach(t => t.classList.remove('active'));
+document.querySelectorAll('#categoryTabs button').forEach(btn => {
+    btn.addEventListener('click', function() {
+        // Clear search box when switching categories
+        document.getElementById('searchInput').value = ''; 
+        
+        document.querySelectorAll('#categoryTabs button').forEach(b => b.classList.remove('active'));
         this.classList.add('active');
         renderCategory(this.dataset.category);
-        document.getElementById('searchInput').value = '';
     });
+});
+// Search through ALL items, ignoring the current category tab
+document.getElementById('searchInput').addEventListener('input', function(e) {
+    const searchTerm = e.target.value.toLowerCase().trim();
+    
+    // If search is empty, go back to showing the active category
+    if (searchTerm === "") {
+        const activeBtn = document.querySelector('#categoryTabs button.active');
+        if (activeBtn) {
+            renderCategory(activeBtn.dataset.category);
+        }
+        return;
+    }
+
+    // Filter from the FULL menuItems array
+    const matches = menuItems.filter(item => 
+        item.item_name.toLowerCase().includes(searchTerm) || 
+        (item.category && item.category.toLowerCase().includes(searchTerm))
+    );
+
+    renderSearchResults(matches);
 });
 
-document.getElementById('searchInput').addEventListener('input', function () {
-    const term = this.value.toLowerCase().trim();
-    grid.querySelectorAll('.col-6, .col-md-4, .col-lg-3').forEach(card => {
-        const text = card.textContent.toLowerCase();
-        card.style.display = text.includes(term) ? 'block' : 'none';
+// Helper function to render global search results
+function renderSearchResults(items) {
+    grid.innerHTML = '';
+    document.getElementById('placeholder').style.display = 'none';
+
+    if (items.length === 0) {
+        grid.innerHTML = '<div class="col-12 text-center py-4 text-muted">No items match your search.</div>';
+        return;
+    }
+
+    items.forEach(item => {
+        const sel = selectedItemsArray.find(i => i.id == item.id) || { qty: 1, notes: '' };
+        const checked = selectedItemsArray.some(i => i.id == item.id);
+        const stockQty = stock[item.item_name] !== undefined ? stock[item.item_name] : 'N/A';
+
+        grid.innerHTML += `
+            <div class="col-6 col-md-4 col-lg-3">
+                <div class="card h-100 border-0 shadow-sm item-card">
+                    <div class="card-body p-3">
+                        <div class="form-check">
+                            <input class="form-check-input" type="checkbox" value="${item.id}" id="item_${item.id}" ${checked ? 'checked' : ''}>
+                            <label class="form-check-label fw-bold d-block" for="item_${item.id}">
+                                ${item.item_name} <span class="text-success float-end">Rs ${item.price}</span>
+                            </label>
+                            <small class="text-muted">${item.category} | Stock: ${stockQty}</small>
+                        </div>
+                        <div id="details_${item.id}" style="display:${checked ? 'block' : 'none'}; margin-top:10px;">
+                            <input type="number" class="form-control form-control-sm mb-1 qty-input" value="${sel.qty}" min="1" data-item-id="${item.id}" placeholder="Qty">
+                            <input type="text" class="form-control form-control-sm notes-input" value="${sel.notes}" data-item-id="${item.id}" placeholder="Notes">
+                        </div>
+                    </div>
+                </div>
+            </div>`;
     });
-});
+}
 
 function showCenterToast(message) {
     document.getElementById('toastMessage').textContent = message;
