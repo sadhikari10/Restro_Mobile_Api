@@ -3,6 +3,12 @@
 session_start();
 require '../Common/connection.php';
 require '../Common/nepali_date.php';
+require '../vendor/autoload.php';   // <-- Important for PhpSpreadsheet
+
+use PhpOffice\PhpSpreadsheet\Spreadsheet;
+use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
+use PhpOffice\PhpSpreadsheet\Style\Alignment;
+use PhpOffice\PhpSpreadsheet\Style\Font;
 
 if (empty($_SESSION['logged_in']) || $_SESSION['role'] !== 'superadmin' || empty($_SESSION['current_restaurant_id'])) {
     header('Location: ../login.php');
@@ -13,11 +19,12 @@ $restaurant_id = $_SESSION['current_restaurant_id'];
 $success_msg = '';
 $error_msg = '';
 $user_id = $_SESSION['user_id'] ?? null;
-$now = nepali_date_time();   // Full Nepali datetime
+$now = nepali_date_time();
 
-// ==================== HANDLE POST ====================
+// ==================== HANDLE POST ACTIONS ====================
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
+    // Add Stock
     if (isset($_POST['add_stock'])) {
         $item_name = trim($_POST['item_name'] ?? '');
         $category  = trim($_POST['category'] ?? '');
@@ -57,13 +64,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $stock_after = $stock_stmt->get_result()->fetch_assoc()['current_stock'] ?? 0;
                 $stock_stmt->close();
 
-                // Save price only for 'added' and 'restocked'
-                $price_to_save = ($action === 'added' || $action === 'restocked') ? $price : NULL;
-
                 $hist = $conn->prepare("INSERT INTO cutlery_history 
                     (cutlery_id, restaurant_id, action, quantity, remarks, changed_by, created_at, stock_after, price) 
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
-                $hist->bind_param("iisissidi", $cutlery_id, $restaurant_id, $action, $qty, $remarks, $user_id, $now, $stock_after, $price_to_save);
+                $hist->bind_param("iisissidi", $cutlery_id, $restaurant_id, $action, $qty, $remarks, $user_id, $now, $stock_after, $price);
                 $hist->execute();
                 $hist->close();
 
@@ -107,12 +111,72 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 }
 
-// Fetch Inventory
+// ==================== FETCH DATA ====================
 $stmt = $conn->prepare("SELECT * FROM cutlery_inventory WHERE restaurant_id = ? ORDER BY category ASC, item_name ASC");
 $stmt->bind_param("i", $restaurant_id);
 $stmt->execute();
 $inventory = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
 $stmt->close();
+
+// ==================== EXCEL EXPORT ====================
+if (isset($_POST['export_excel'])) {
+    ob_end_clean();
+
+    $spreadsheet = new Spreadsheet();
+    $sheet = $spreadsheet->getActiveSheet();
+    $sheet->setTitle('Cutlery Inventory');
+
+    // Header
+    $sheet->setCellValue('A1', 'CUTLERY INVENTORY REPORT');
+    $sheet->mergeCells('A1:G1');
+    $sheet->getStyle('A1')->getFont()->setSize(16)->setBold(true);
+    $sheet->getStyle('A1')->getAlignment()->setHorizontal(Alignment::HORIZONTAL_CENTER);
+
+    $sheet->setCellValue('A2', 'Generated on: ' . date('Y-m-d H:i:s'));
+    $sheet->mergeCells('A2:G2');
+
+    $row = 4;
+
+    // Table Headers
+    $headers = ['Item Name', 'Category', 'Current Stock', 'Broken', 'Missing', 'Total Purchased', 'Unit Price'];
+    $col = 'A';
+    foreach ($headers as $header) {
+        $sheet->setCellValue($col . $row, $header);
+        $sheet->getStyle($col . $row)->getFont()->setBold(true);
+        $col++;
+    }
+    $row++;
+
+    // Data
+    foreach ($inventory as $item) {
+        $sheet->setCellValue('A' . $row, $item['item_name']);
+        $sheet->setCellValue('B' . $row, $item['category']);
+        $sheet->setCellValue('C' . $row, $item['current_stock']);
+        $sheet->setCellValue('D' . $row, $item['broken_qty'] ?? 0);
+        $sheet->setCellValue('E' . $row, $item['missing_qty'] ?? 0);
+        $sheet->setCellValue('F' . $row, $item['total_purchased']);
+        $sheet->setCellValue('G' . $row, $item['unit_price']);
+
+        $sheet->getStyle('C' . $row . ':G' . $row)->getAlignment()->setHorizontal(Alignment::HORIZONTAL_RIGHT);
+        $row++;
+    }
+
+    // Auto size columns
+    foreach (range('A', 'G') as $col) {
+        $sheet->getColumnDimension($col)->setAutoSize(true);
+    }
+
+    // Download
+    $filename = "Cutlery_Inventory_" . date('Y-m-d') . ".xlsx";
+
+    header('Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    header('Content-Disposition: attachment; filename="' . $filename . '"');
+    header('Cache-Control: max-age=0');
+
+    $writer = new Xlsx($spreadsheet);
+    $writer->save('php://output');
+    exit;
+}
 ?>
 
 <!doctype html>
@@ -136,7 +200,11 @@ $stmt->close();
         <h3 class="fw-bold text-success"><i class="bi bi-silverware me-2"></i>Cutlery Inventory</h3>
         <div>
             <a href="view_branch.php" class="btn btn-secondary me-2">Back</a>
-            <button onclick="exportCurrentToExcel()" class="btn btn-success">Export All</button>
+            <form method="POST" style="display: inline;">
+                <button type="submit" name="export_excel" class="btn btn-success">
+                    <i class="bi bi-file-earmark-excel"></i> Export Excel
+                </button>
+            </form>
         </div>
     </div>
 
@@ -144,6 +212,7 @@ $stmt->close();
     <?php if($error_msg): ?><div class="alert alert-danger"><?= $error_msg ?></div><?php endif; ?>
 
     <div class="row g-4">
+        <!-- Add Stock Form -->
         <div class="col-lg-4">
             <div class="card shadow-sm">
                 <div class="card-header bg-white py-3">
@@ -152,11 +221,11 @@ $stmt->close();
                 <div class="card-body">
                     <form method="POST">
                         <div class="mb-3">
-                            <label>Item Name</label>
+                            <label class="form-label">Item Name</label>
                             <input type="text" name="item_name" class="form-control" required>
                         </div>
                         <div class="mb-3">
-                            <label>Category</label>
+                            <label class="form-label">Category</label>
                             <input type="text" name="category" class="form-control" list="catList" required>
                             <datalist id="catList">
                                 <?php foreach(array_unique(array_column($inventory,'category')) as $c): ?>
@@ -166,16 +235,16 @@ $stmt->close();
                         </div>
                         <div class="row">
                             <div class="col-6 mb-3">
-                                <label>Quantity</label>
+                                <label class="form-label">Quantity</label>
                                 <input type="number" name="quantity" class="form-control" min="1" required>
                             </div>
                             <div class="col-6 mb-3">
-                                <label>Unit Price (Rs)</label>
+                                <label class="form-label">Unit Price (Rs)</label>
                                 <input type="number" step="0.01" name="unit_price" class="form-control" value="0">
                             </div>
                         </div>
                         <div class="mb-3">
-                            <label>Remarks</label>
+                            <label class="form-label">Remarks</label>
                             <input type="text" name="remarks" class="form-control" placeholder="Optional">
                         </div>
                         <button type="submit" name="add_stock" class="btn btn-success w-100">Add Stock</button>
@@ -184,6 +253,7 @@ $stmt->close();
             </div>
         </div>
 
+        <!-- Inventory Table -->
         <div class="col-lg-8">
             <div class="card shadow-sm">
                 <div class="table-responsive">
@@ -224,7 +294,7 @@ $stmt->close();
     </div>
 </div>
 
-<!-- Add Stock Modal -->
+<!-- Modals (Add Stock & Loss) -->
 <div class="modal fade" id="addStockModal" tabindex="-1">
     <div class="modal-dialog modal-dialog-centered">
         <div class="modal-content">
@@ -236,7 +306,6 @@ $stmt->close();
                 <div class="modal-body">
                     <input type="hidden" name="item_name" id="stock_item_name">
                     <input type="hidden" name="category" id="stock_category">
-
                     <div class="mb-3">
                         <label>Quantity to Add</label>
                         <input type="number" name="quantity" class="form-control" min="1" required>
@@ -259,7 +328,6 @@ $stmt->close();
     </div>
 </div>
 
-<!-- Loss Modal -->
 <div class="modal fade" id="lossModal" tabindex="-1">
     <div class="modal-dialog modal-dialog-centered">
         <div class="modal-content">
@@ -303,22 +371,6 @@ function showLossModal(id, type) {
     document.getElementById('loss_type').value = type;
     document.getElementById('lossTitle').textContent = type === 'broken' ? 'Record Broken Items' : 'Record Missing Items';
     new bootstrap.Modal(document.getElementById('lossModal')).show();
-}
-
-function exportCurrentToExcel() {
-    const table = document.getElementById('inventoryTable');
-    let csv = "Item Name,Category,Current Stock,Broken,Missing,Total Bought\n";
-    table.querySelectorAll('tbody tr').forEach(row => {
-        const cells = row.querySelectorAll('td');
-        if (cells.length) {
-            csv += `"${cells[0].innerText.replace(/"/g,'""')}","${cells[1].innerText}",${cells[2].innerText},${cells[3].innerText},${cells[4].innerText},${cells[5].innerText}\n`;
-        }
-    });
-    const blob = new Blob([csv], { type: 'text/csv' });
-    const link = document.createElement('a');
-    link.href = URL.createObjectURL(blob);
-    link.download = 'cutlery_inventory.csv';
-    link.click();
 }
 </script>
 
