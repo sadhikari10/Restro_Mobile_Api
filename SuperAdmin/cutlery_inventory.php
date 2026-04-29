@@ -67,7 +67,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $hist = $conn->prepare("INSERT INTO cutlery_history 
                     (cutlery_id, restaurant_id, action, quantity, remarks, changed_by, created_at, stock_after, price) 
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
-                $hist->bind_param("iisissidi", $cutlery_id, $restaurant_id, $action, $qty, $remarks, $user_id, $now, $stock_after, $price);
+                $hist->bind_param("iisisssdi", $cutlery_id, $restaurant_id, $action, $qty, $remarks, $user_id, $now, $stock_after, $price);
                 $hist->execute();
                 $hist->close();
 
