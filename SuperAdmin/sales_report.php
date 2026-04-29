@@ -99,7 +99,9 @@ function get_date_range(string $period, string $fiscal_year, string $nepali_mont
 
 // === FILTER HANDLING ===
 $period = $_POST['period'] ?? 'year';
-$fiscal_year = $_POST['fiscal_year'] ?? $fiscal_years[0];
+$default_fy = !empty($fiscal_years) ? $fiscal_years[0] : get_fiscal_year(ad_to_bs(date('Y-m-d')));
+
+$fiscal_year = $_POST['fiscal_year'] ?? $default_fy;
 $nepali_month = $_POST['nepali_month'] ?? '';
 $specific_date = $_POST['specific_date'] ?? '';
 $week_num = $_POST['week_num'] ?? '1';
