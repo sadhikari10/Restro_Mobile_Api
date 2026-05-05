@@ -106,7 +106,8 @@ if (!$branch) {
             <a href="cancel_order.php" class="btn btn-dark">Canceled</a>
             <a href="add_table.php" class="btn btn-dark">Add Table</a>
             <a href="cutlery_inventory.php" class="btn btn-dark">Cutlery</a>
-          
+            <a href="laundry.php" class="btn btn-dark">Laundry</a>
+            <a href="manage_room.php" class="btn btn-dark">Room Details</a>
           </div>
         </div>
       </div>
