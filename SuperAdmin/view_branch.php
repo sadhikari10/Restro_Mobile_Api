@@ -110,6 +110,7 @@ if (!$branch) {
             <a href="manage_room.php" class="btn btn-dark">Room Details</a>
             <a href="booking.php" class="btn btn-dark">Check In</a>
             <a href="checkout.php" class="btn btn-dark">Check Out</a>
+            <a href="booking_history.php" class="btn btn-dark">Booking History</a>
           </div>
         </div>
       </div>
