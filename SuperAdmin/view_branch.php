@@ -93,9 +93,9 @@ if (!$branch) {
             <a href="staff_detail.php" class="btn btn-info">Staff</a>
             <a href="take_order.php" class="btn btn-success">Take Order</a>
             <a href="edit_orders.php" class="btn btn-success">Edit Order</a>
-            <a href="orders.php" class="btn btn-warning">View Orders</a>
-            <a href="charges.php" class="btn btn-secondary">Charges & VAT</a>
+            <a href="orders.php" class="btn btn-success">View Orders</a>
             <a href="order_history.php" class="btn btn-success">Order History</a>
+            <a href="charges.php" class="btn btn-secondary">Charges & VAT</a>
             <a href="stock_management.php" class="btn btn-dark">Inventory</a>
 	          <a href="view_stock.php" class="btn btn-dark">Inventory History</a>
             <a href="general_purchase.php" class="btn btn-dark">General purchase</a>
